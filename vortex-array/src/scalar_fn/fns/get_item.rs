@@ -25,9 +25,7 @@ use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ExecutionArgs;
-use crate::scalar_fn::ReduceCtx;
 use crate::scalar_fn::ReduceNode;
-use crate::scalar_fn::ReduceNodeRef;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::ScalarFnVTableExt;
@@ -120,12 +118,7 @@ impl ScalarFnVTable for GetItem {
         }
     }
 
-    fn reduce(
-        &self,
-        field_name: &FieldName,
-        node: &dyn ReduceNode,
-        ctx: &dyn ReduceCtx,
-    ) -> VortexResult<Option<ReduceNodeRef>> {
+    fn reduce<T: ReduceNode>(&self, field_name: &FieldName, node: &T) -> VortexResult<Option<T>> {
         let child = node.child(0);
         if let Some(child_fn) = child.scalar_fn()
             && let Some(pack) = child_fn.as_opt::<Pack>()
@@ -135,9 +128,9 @@ impl ScalarFnVTable for GetItem {
 
             // Possibly mask the field if the pack is nullable
             if pack.nullability.is_nullable() {
-                field = ctx.new_node(
+                field = node.new_node(
                     Mask.bind(EmptyOptions),
-                    &[field, ctx.new_node(Literal.bind(true.into()), &[])?],
+                    &[field, node.new_node(Literal.bind(true.into()), &[])?],
                 )?;
             }
 
