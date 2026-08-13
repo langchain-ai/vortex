@@ -160,10 +160,16 @@ fn binary_falsify<P: NonNanProof>(
             let rhs_falsifier = ctx.falsify(rhs)?;
             or_collect(lhs_falsifier.into_iter().chain(rhs_falsifier))
         }
-        Operator::Or => match (ctx.falsify(lhs)?, ctx.falsify(rhs)?) {
-            (Some(lhs), Some(rhs)) if P::EMIT_UNGUARDED_REWRITES => Some(and(lhs, rhs)),
-            _ => None,
-        },
+        Operator::Or => {
+            if !P::EMIT_UNGUARDED_REWRITES {
+                return Ok(None);
+            }
+
+            match (ctx.falsify(lhs)?, ctx.falsify(rhs)?) {
+                (Some(lhs), Some(rhs)) => Some(and(lhs, rhs)),
+                _ => None,
+            }
+        }
         Operator::Add | Operator::Sub | Operator::Mul | Operator::Div => None,
     })
 }
@@ -694,14 +700,18 @@ fn stat_fn(expr: Expression, aggregate_fn: AggregateFnRef) -> Expression {
 mod tests {
     use std::sync::Arc;
     use std::sync::LazyLock;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
+    use super::AllNonNanProof;
     use super::StatFn;
     use super::StatOptions;
     use super::all_non_null;
     use super::all_null;
+    use super::binary_falsify;
     use crate::aggregate_fn::AggregateFnRef;
     use crate::aggregate_fn::AggregateFnVTableExt;
     use crate::aggregate_fn::EmptyOptions as AggregateEmptyOptions;
@@ -730,15 +740,39 @@ mod tests {
     use crate::expr::stats::Stat;
     use crate::scalar::Scalar;
     use crate::scalar_fn::EmptyOptions;
+    use crate::scalar_fn::ScalarFnId;
+    use crate::scalar_fn::ScalarFnVTable;
     use crate::scalar_fn::ScalarFnVTableExt;
     use crate::scalar_fn::fns::between::BetweenOptions;
     use crate::scalar_fn::fns::between::StrictComparison;
+    use crate::scalar_fn::fns::binary::Binary;
     use crate::scalar_fn::fns::dynamic::DynamicComparison;
     use crate::scalar_fn::fns::dynamic::DynamicComparisonExpr;
     use crate::scalar_fn::fns::operators::CompareOperator;
     use crate::scalar_fn::internal::row_count::RowCount;
+    use crate::stats::rewrite::StatsRewriteCtx;
+    use crate::stats::rewrite::StatsRewriteRule;
+    use crate::stats::session::StatsSessionExt;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(crate::array_session);
+
+    #[derive(Debug)]
+    struct CountingBinaryRule(Arc<AtomicUsize>);
+
+    impl StatsRewriteRule for CountingBinaryRule {
+        fn scalar_fn_id(&self) -> ScalarFnId {
+            Binary.id()
+        }
+
+        fn falsify(
+            &self,
+            _expr: &Expression,
+            _ctx: &StatsRewriteCtx<'_>,
+        ) -> VortexResult<Option<Expression>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
 
     fn stat(expr: Expression, stat: Stat) -> Expression {
         let aggregate_fn = stat.aggregate_fn().expect("stat should have aggregate fn");
@@ -829,6 +863,22 @@ mod tests {
                 gt_eq(stat(col("a"), Stat::Min), lit(50)),
             ))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_non_nan_proof_does_not_rewrite_or_children() -> VortexResult<()> {
+        let session = crate::array_session();
+        let calls = Arc::new(AtomicUsize::new(0));
+        session
+            .stats()
+            .register_rewrite(CountingBinaryRule(Arc::clone(&calls)));
+        let scope = test_scope();
+        let ctx = StatsRewriteCtx::new(&session, &scope);
+        let expr = or(gt(col("a"), lit(10)), lt(col("a"), lit(50)));
+
+        assert_eq!(binary_falsify::<AllNonNanProof>(&expr, &ctx)?, None);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
         Ok(())
     }
 
