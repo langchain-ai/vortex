@@ -34,6 +34,7 @@ use crate::LazyReaderChildren;
 use crate::VTable;
 use crate::layouts::zoned::ZonedData;
 use crate::layouts::zoned::zone_map::ZoneMap;
+use crate::layouts::zoned::zone_map::prepare_pruning_predicate;
 
 type SharedZoneMap = Shared<BoxFuture<'static, SharedVortexResult<ZoneMap>>>;
 pub(super) type SharedPruningResult =
@@ -45,6 +46,7 @@ pub(super) struct PruningState {
     row_count: u64,
     zone_len: u64,
     dtype: DType,
+    stats_table_dtype: DType,
     aggregate_fns: Arc<[AggregateFnRef]>,
     lazy_children: Arc<LazyReaderChildren>,
     session: VortexSession,
@@ -57,6 +59,7 @@ impl PruningState {
     pub(super) fn new<V>(
         layout: Layout<V>,
         zone_count: usize,
+        stats_table_dtype: DType,
         aggregate_fns: Arc<[AggregateFnRef]>,
         lazy_children: Arc<LazyReaderChildren>,
         session: VortexSession,
@@ -69,6 +72,7 @@ impl PruningState {
             row_count: layout.row_count(),
             zone_len: layout.zone_len as u64,
             dtype: layout.dtype().clone(),
+            stats_table_dtype,
             aggregate_fns,
             lazy_children,
             session,
@@ -103,11 +107,11 @@ impl PruningState {
                             async move {
                                 let zone_map = zone_map.await?;
                                 let initial_mask =
-                                    zone_map.prune(&predicate, &session).map_err(|err| {
-                                        err.with_context(format!(
-                                        "While evaluating pruning predicate {} (derived from {})",
-                                        predicate, expr
-                                    ))
+                                    zone_map.prune_prepared(&predicate, &session).map_err(|err| {
+                                     err.with_context(format!(
+                                            "While evaluating pruning predicate {} (derived from {})",
+                                            predicate, expr
+                                        ))
                                     })?;
                                 Ok(Arc::new(PruningResult {
                                     zone_map,
@@ -132,10 +136,23 @@ impl PruningState {
         self.pruning_predicates
             .entry(key)
             .or_default()
-            .get_or_init(move || match expr.falsify(&self.session) {
+            .get_or_init(move || match expr
+                .falsify(&self.session)
+                .and_then(|predicate| {
+                    predicate
+                        .map(|predicate| {
+                            prepare_pruning_predicate(
+                                predicate,
+                                &self.dtype,
+                                &self.stats_table_dtype,
+                                &self.aggregate_fns,
+                            )
+                        })
+                        .transpose()
+                }) {
                 Ok(predicate) => predicate,
                 Err(error) => {
-                    trace!(%expr, %error, "failed to construct stats rewrite predicate");
+                    trace!(%expr, error = ?error, "failed to construct stats rewrite predicate");
                     None
                 }
             })
@@ -225,7 +242,7 @@ impl PruningResult {
 
         let next_mask = self
             .zone_map
-            .prune(&self.predicate, &self.session)
+            .prune_prepared(&self.predicate, &self.session)
             .map_err(|err| {
                 err.with_context(format!(
                     "While evaluating pruning predicate {}",

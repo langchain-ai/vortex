@@ -16,10 +16,10 @@ use vortex_array::aggregate_fn::fns::all_non_null::AllNonNull;
 use vortex_array::aggregate_fn::fns::all_null::AllNull;
 use vortex_array::aggregate_fn::fns::bounded_max::BOUNDED_MAX_BOUND;
 use vortex_array::aggregate_fn::fns::bounded_max::BoundedMax;
+use vortex_array::aggregate_fn::fns::nan_count::NanCount;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
-use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
@@ -143,12 +143,20 @@ impl ZoneMap {
         predicate: &BoundExpression,
         session: &VortexSession,
     ) -> VortexResult<Mask> {
+        let predicate = self.lower_stats(predicate.clone())?;
+        self.prune_prepared(&predicate, session)
+    }
+
+    pub(super) fn prune_prepared(
+        &self,
+        predicate: &BoundExpression,
+        session: &VortexSession,
+    ) -> VortexResult<Mask> {
         let mut ctx = session.create_execution_ctx();
         let num_zones = self.array.len();
-        let predicate = self.lower_stats(predicate.clone())?;
 
         let array = self.array.clone().into_array();
-        let applied = array.apply_bound(&predicate)?;
+        let applied = array.apply_bound(predicate)?;
 
         if !contains_row_count(&applied) {
             return applied.null_as_false().execute(&mut ctx);
@@ -160,13 +168,33 @@ impl ZoneMap {
     }
 
     fn lower_stats(&self, predicate: BoundExpression) -> VortexResult<BoundExpression> {
-        let binder = ZoneMapStatsBinder { zone_map: self };
-        bind_stats(predicate, &binder)
+        prepare_pruning_predicate(
+            predicate,
+            &self.column_dtype,
+            self.array.dtype(),
+            &self.aggregate_fns,
+        )
     }
 }
 
+pub(super) fn prepare_pruning_predicate(
+    predicate: BoundExpression,
+    column_dtype: &DType,
+    stats_table_dtype: &DType,
+    aggregate_fns: &[AggregateFnRef],
+) -> VortexResult<BoundExpression> {
+    let binder = ZoneMapStatsBinder {
+        column_dtype,
+        stats_table_dtype,
+        aggregate_fns,
+    };
+    bind_stats(predicate, &binder)
+}
+
 struct ZoneMapStatsBinder<'a> {
-    zone_map: &'a ZoneMap,
+    column_dtype: &'a DType,
+    stats_table_dtype: &'a DType,
+    aggregate_fns: &'a [AggregateFnRef],
 }
 
 impl StatBinder for ZoneMapStatsBinder<'_> {
@@ -176,23 +204,34 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
         aggregate_fn: &AggregateFnRef,
         _stat_dtype: &DType,
     ) -> VortexResult<Option<BoundExpression>> {
+        if !has_nans(input.dtype()) {
+            if aggregate_fn.is::<NanCount>() {
+                return Ok(Some(self.bind_target(lit(0u64))?));
+            }
+            if aggregate_fn.is::<AllNan>() {
+                return Ok(Some(self.bind_target(lit(false))?));
+            }
+            if aggregate_fn.is::<AllNonNan>() {
+                return Ok(Some(self.bind_target(lit(true))?));
+            }
+        }
+
         if !input.is_root() {
             return Ok(None);
         }
         vortex_ensure!(
-            input.dtype() == &self.zone_map.column_dtype,
+            input.dtype() == self.column_dtype,
             "Stats predicate root dtype {} does not match zone-map column dtype {}",
             input.dtype(),
-            self.zone_map.column_dtype
+            self.column_dtype
         );
 
-        if let Some(stat_expr) = self.zone_map.aggregate_field_expr(aggregate_fn) {
+        if let Some(stat_expr) = self.aggregate_field_expr(aggregate_fn) {
             return Ok(Some(self.bind_target(stat_expr)?));
         }
 
         if aggregate_fn.is::<AllNull>() {
             return self
-                .zone_map
                 .stat_field_expr(Stat::NullCount)
                 .map(|null_count| self.bind_target(eq(null_count, row_count_expr())))
                 .transpose();
@@ -200,7 +239,6 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
 
         if aggregate_fn.is::<AllNonNull>() {
             return self
-                .zone_map
                 .stat_field_expr(Stat::NullCount)
                 .map(|null_count| self.bind_target(eq(null_count, lit(0u64))))
                 .transpose();
@@ -208,7 +246,6 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
 
         if aggregate_fn.is::<AllNan>() {
             return self
-                .zone_map
                 .stat_field_expr(Stat::NaNCount)
                 .map(|nan_count| self.bind_target(eq(nan_count, row_count_expr())))
                 .transpose();
@@ -216,7 +253,6 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
 
         if aggregate_fn.is::<AllNonNan>() {
             return self
-                .zone_map
                 .stat_field_expr(Stat::NaNCount)
                 .map(|nan_count| self.bind_target(eq(nan_count, lit(0u64))))
                 .transpose();
@@ -224,7 +260,6 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
 
         if let Some(stat) = Stat::from_aggregate_fn(aggregate_fn) {
             return self
-                .zone_map
                 .stat_field_expr(stat)
                 .map(|expr| self.bind_target(expr))
                 .transpose();
@@ -236,14 +271,12 @@ impl StatBinder for ZoneMapStatsBinder<'_> {
 
 impl ZoneMapStatsBinder<'_> {
     fn bind_target(&self, expr: Expression) -> VortexResult<BoundExpression> {
-        expr.bind(self.zone_map.array.dtype())
+        expr.bind(self.stats_table_dtype)
     }
-}
 
-impl ZoneMap {
     fn aggregate_field_expr(&self, requested: &AggregateFnRef) -> Option<Expression> {
         let field_name = requested.to_string();
-        if self.array.unmasked_field_by_name_opt(&field_name).is_some() {
+        if self.has_field(&field_name) {
             return Some(aggregate_result_expr(
                 requested,
                 get_item(field_name, root()),
@@ -251,9 +284,9 @@ impl ZoneMap {
         }
 
         let mut approximate = None;
-        for stored in self.aggregate_fns.iter() {
+        for stored in self.aggregate_fns {
             let field_name = stored.to_string();
-            if self.array.unmasked_field_by_name_opt(&field_name).is_none() {
+            if !self.has_field(&field_name) {
                 continue;
             }
 
@@ -282,11 +315,15 @@ impl ZoneMap {
     }
 
     fn legacy_stat_field_expr(&self, stat: Stat) -> Option<Expression> {
-        if self.array.unmasked_field_by_name_opt(stat.name()).is_some() {
+        if self.has_field(stat.name()) {
             return Some(get_item(stat.name(), root()));
         }
 
         None
+    }
+
+    fn has_field(&self, name: &str) -> bool {
+        self.stats_table_dtype.as_struct_fields().find(name).is_some()
     }
 }
 
@@ -300,6 +337,10 @@ fn aggregate_result_expr(stored: &AggregateFnRef, state_expr: Expression) -> Exp
 
 fn row_count_expr() -> Expression {
     RowCount.new_expr(EmptyOptions, [])
+}
+
+fn has_nans(dtype: &DType) -> bool {
+    matches!(dtype, DType::Primitive(ptype, _) if ptype.is_float())
 }
 
 /// Build per-zone row counts for a zone map.

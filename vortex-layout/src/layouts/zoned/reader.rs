@@ -52,7 +52,8 @@ impl ZonedReader {
         V: VTable<LayoutData = ZonedData>,
     {
         let aggregate_fns = layout.aggregate_fns();
-        let dtypes = vec![layout.dtype().clone(), layout.stats_table_dtype.clone()];
+        let stats_table_dtype = layout.stats_table_dtype.clone();
+        let dtypes = vec![layout.dtype().clone(), stats_table_dtype.clone()];
         let names = vec![Arc::clone(&name), format!("{}.zones", name).into()];
         let lazy_children = Arc::new(LazyReaderChildren::new(
             Arc::clone(layout.children()),
@@ -70,6 +71,7 @@ impl ZonedReader {
             pruning: PruningState::new(
                 layout,
                 zone_count,
+                stats_table_dtype,
                 aggregate_fns,
                 Arc::clone(&lazy_children),
                 session,
