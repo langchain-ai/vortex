@@ -20,7 +20,6 @@ use vortex_array::aggregate_fn::fns::nan_count::NanCount;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::StructArray;
-use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::expr::Expression;
 use vortex_array::expr::eq;
@@ -29,11 +28,8 @@ use vortex_array::expr::is_root;
 use vortex_array::expr::lit;
 use vortex_array::expr::root;
 use vortex_array::expr::stats::Stat;
-use vortex_array::expr::traversal::NodeExt;
-use vortex_array::expr::traversal::Transformed;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::ScalarFnVTableExt;
-use vortex_array::scalar_fn::fns::stat::StatFn;
 use vortex_array::scalar_fn::internal::row_count::RowCount;
 use vortex_array::scalar_fn::internal::row_count::contains_row_count;
 use vortex_array::scalar_fn::internal::row_count::substitute_row_count;
@@ -142,11 +138,19 @@ impl ZoneMap {
     /// final zone may be shorter than the nominal zone length, so it is materialized
     /// only after the predicate has been lowered to the zone-map table.
     pub fn prune(&self, predicate: &Expression, session: &VortexSession) -> VortexResult<Mask> {
+        let predicate = self.lower_stats(predicate.clone())?;
+        self.prune_prepared(&predicate, session)
+    }
+
+    pub(super) fn prune_prepared(
+        &self,
+        predicate: &Expression,
+        session: &VortexSession,
+    ) -> VortexResult<Mask> {
         let mut ctx = session.create_execution_ctx();
         let num_zones = self.array.len();
-        let predicate = self.lower_stats(predicate.clone())?;
 
-        let applied = self.array.clone().into_array().apply(&predicate)?;
+        let applied = self.array.clone().into_array().apply(predicate)?;
 
         if !contains_row_count(&applied) {
             return applied.null_as_false().execute(&mut ctx);
@@ -158,107 +162,102 @@ impl ZoneMap {
     }
 
     fn lower_stats(&self, predicate: Expression) -> VortexResult<Expression> {
-        let predicate = self.lower_non_float_nan_stats(predicate)?;
-        let binder = ZoneMapStatsBinder { zone_map: self };
-        bind_stats(predicate, &binder)?.optimize_recursive(self.array.dtype())
-    }
-
-    fn lower_non_float_nan_stats(&self, predicate: Expression) -> VortexResult<Expression> {
-        predicate
-            .transform_down(|expr| {
-                if !expr.is::<StatFn>() {
-                    return Ok(Transformed::no(expr));
-                }
-
-                let options = expr.as_::<StatFn>();
-                let aggregate_fn = options.aggregate_fn();
-                let input_dtype = expr.child(0).return_dtype(&self.column_dtype)?;
-
-                if has_nans(&input_dtype) {
-                    return Ok(Transformed::no(expr));
-                }
-
-                if aggregate_fn.is::<NanCount>() {
-                    return Ok(Transformed::yes(lit(0u64)));
-                }
-
-                if aggregate_fn.is::<AllNan>() {
-                    return Ok(Transformed::yes(lit(false)));
-                }
-
-                if aggregate_fn.is::<AllNonNan>() {
-                    return Ok(Transformed::yes(lit(true)));
-                }
-
-                Ok(Transformed::no(expr))
-            })
-            .map(Transformed::into_inner)
+        prepare_pruning_predicate(
+            predicate,
+            &self.column_dtype,
+            self.array.dtype(),
+            &self.aggregate_fns,
+        )
     }
 }
 
+pub(super) fn prepare_pruning_predicate(
+    predicate: Expression,
+    column_dtype: &DType,
+    stats_table_dtype: &DType,
+    aggregate_fns: &[AggregateFnRef],
+) -> VortexResult<Expression> {
+    let binder = ZoneMapStatsBinder {
+        column_dtype,
+        stats_table_dtype,
+        aggregate_fns,
+    };
+    bind_stats(predicate, &binder)?.optimize_recursive(stats_table_dtype)
+}
+
 struct ZoneMapStatsBinder<'a> {
-    zone_map: &'a ZoneMap,
+    column_dtype: &'a DType,
+    stats_table_dtype: &'a DType,
+    aggregate_fns: &'a [AggregateFnRef],
 }
 
 impl StatBinder for ZoneMapStatsBinder<'_> {
     fn scope(&self) -> &DType {
-        &self.zone_map.column_dtype
+        self.column_dtype
     }
 
     fn bind_aggregate(
         &self,
         input: &Expression,
         aggregate_fn: &AggregateFnRef,
-        _stat_dtype: &DType,
     ) -> VortexResult<Option<Expression>> {
+        let input_dtype = input.return_dtype(self.column_dtype)?;
+        if !has_nans(&input_dtype) {
+            if aggregate_fn.is::<NanCount>() {
+                return Ok(Some(lit(0u64)));
+            }
+            if aggregate_fn.is::<AllNan>() {
+                return Ok(Some(lit(false)));
+            }
+            if aggregate_fn.is::<AllNonNan>() {
+                return Ok(Some(lit(true)));
+            }
+        }
+
         if !is_root(input) {
             return Ok(None);
         }
 
-        if let Some(stat_expr) = self.zone_map.aggregate_field_expr(aggregate_fn) {
+        if let Some(stat_expr) = self.aggregate_field_expr(aggregate_fn) {
             return Ok(Some(stat_expr));
         }
 
         if aggregate_fn.is::<AllNull>() {
             return Ok(self
-                .zone_map
                 .stat_field_expr(Stat::NullCount)
                 .map(|null_count| eq(null_count, row_count_expr())));
         }
 
         if aggregate_fn.is::<AllNonNull>() {
             return Ok(self
-                .zone_map
                 .stat_field_expr(Stat::NullCount)
                 .map(|null_count| eq(null_count, lit(0u64))));
         }
 
         if aggregate_fn.is::<AllNan>() {
             return Ok(self
-                .zone_map
                 .stat_field_expr(Stat::NaNCount)
                 .map(|nan_count| eq(nan_count, row_count_expr())));
         }
 
         if aggregate_fn.is::<AllNonNan>() {
             return Ok(self
-                .zone_map
                 .stat_field_expr(Stat::NaNCount)
                 .map(|nan_count| eq(nan_count, lit(0u64))));
         }
 
         if let Some(stat) = Stat::from_aggregate_fn(aggregate_fn) {
-            return Ok(self.zone_map.stat_field_expr(stat));
+            return Ok(self.stat_field_expr(stat));
         }
 
         Ok(None)
     }
 }
 
-impl ZoneMap {
+impl ZoneMapStatsBinder<'_> {
     fn aggregate_field_expr(&self, requested: &AggregateFnRef) -> Option<Expression> {
         let field_name = requested.to_string();
-        if self.array.unmasked_field_by_name_opt(&field_name).is_some() {
+        if self.has_field(&field_name) {
             return Some(aggregate_result_expr(
                 requested,
                 get_item(field_name, root()),
@@ -266,9 +265,9 @@ impl ZoneMap {
         }
 
         let mut approximate = None;
-        for stored in self.aggregate_fns.iter() {
+        for stored in self.aggregate_fns {
             let field_name = stored.to_string();
-            if self.array.unmasked_field_by_name_opt(&field_name).is_none() {
+            if !self.has_field(&field_name) {
                 continue;
             }
 
@@ -297,11 +296,15 @@ impl ZoneMap {
     }
 
     fn legacy_stat_field_expr(&self, stat: Stat) -> Option<Expression> {
-        if self.array.unmasked_field_by_name_opt(stat.name()).is_some() {
+        if self.has_field(stat.name()) {
             return Some(get_item(stat.name(), root()));
         }
 
         None
+    }
+
+    fn has_field(&self, name: &str) -> bool {
+        self.stats_table_dtype.as_struct_fields().find(name).is_some()
     }
 }
 

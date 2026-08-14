@@ -44,9 +44,10 @@ impl ZonedReader {
         ctx: crate::LayoutReaderContext,
     ) -> VortexResult<Self> {
         let aggregate_fns = layout.aggregate_fns(&session)?;
+        let stats_table_dtype = layout.stats_table_dtype_for(&aggregate_fns);
         let dtypes = vec![
             layout.dtype.clone(),
-            layout.stats_table_dtype_for(&aggregate_fns),
+            stats_table_dtype.clone(),
         ];
         let names = vec![Arc::clone(&name), format!("{}.zones", name).into()];
         let lazy_children = Arc::new(LazyReaderChildren::new(
@@ -59,7 +60,13 @@ impl ZonedReader {
         ));
 
         Ok(Self {
-            pruning: PruningState::new(&layout, aggregate_fns, Arc::clone(&lazy_children), session),
+            pruning: PruningState::new(
+                &layout,
+                stats_table_dtype,
+                aggregate_fns,
+                Arc::clone(&lazy_children),
+                session,
+            ),
             layout,
             name,
             lazy_children,

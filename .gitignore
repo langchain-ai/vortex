@@ -127,6 +127,11 @@ celerybeat.pid
 .env
 .env.*
 .venv
+*.pem
+*.key
+*.crt
+credentials.json
+node_modules/
 env/
 venv/
 ENV/

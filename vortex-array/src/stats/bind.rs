@@ -19,8 +19,6 @@ use crate::aggregate_fn::AggregateFnRef;
 use crate::dtype::DType;
 use crate::expr::Expression;
 use crate::expr::lit;
-use crate::expr::traversal::NodeExt;
-use crate::expr::traversal::Transformed;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::stat::StatFn;
 
@@ -42,7 +40,6 @@ pub trait StatBinder {
         &self,
         input: &Expression,
         aggregate_fn: &AggregateFnRef,
-        stat_dtype: &DType,
     ) -> VortexResult<Option<Expression>>;
 
     /// Expression to use when a stat is unavailable.
@@ -63,27 +60,45 @@ pub fn bind_stats<B: StatBinder + ?Sized>(
     predicate: Expression,
     binder: &B,
 ) -> VortexResult<Expression> {
-    let scope = binder.scope().clone();
-    Ok(predicate
-        .transform_down(|expr| {
-            if !expr.is::<StatFn>() {
-                return Ok(Transformed::no(expr));
-            }
+    Ok(bind_stats_expr(&predicate, binder)?.unwrap_or(predicate))
+}
 
-            match bind_stat_fn(&expr, &scope, binder)? {
-                Some(bound) => Ok(Transformed::yes(bound)),
-                None => {
-                    let dtype = expr.return_dtype(&scope)?;
-                    Ok(Transformed::yes(binder.missing_stat(dtype)?))
-                }
+fn bind_stats_expr(
+    expr: &Expression,
+    binder: &(impl StatBinder + ?Sized),
+) -> VortexResult<Option<Expression>> {
+    if expr.is::<StatFn>() {
+        return match bind_stat_fn(expr, binder)? {
+            Some(bound) => Ok(Some(bound)),
+            None => {
+                let dtype = expr.return_dtype(binder.scope())?;
+                Ok(Some(binder.missing_stat(dtype)?))
             }
-        })?
-        .into_inner())
+        };
+    }
+
+    let mut new_children: Option<Vec<Expression>> = None;
+    for (idx, child) in expr.children().iter().enumerate() {
+        match (new_children.as_mut(), bind_stats_expr(child, binder)?) {
+            (None, None) => {}
+            (Some(children), None) => children.push(child.clone()),
+            (Some(children), Some(bound)) => children.push(bound),
+            (None, Some(bound)) => {
+                let mut children = Vec::with_capacity(expr.children().len());
+                children.extend(expr.children()[..idx].iter().cloned());
+                children.push(bound);
+                new_children = Some(children);
+            }
+        }
+    }
+
+    new_children
+        .map(|children| expr.clone().with_children(children))
+        .transpose()
 }
 
 fn bind_stat_fn(
     expr: &Expression,
-    scope: &DType,
     binder: &(impl StatBinder + ?Sized),
 ) -> VortexResult<Option<Expression>> {
     let options = expr.as_::<StatFn>();
@@ -91,8 +106,7 @@ fn bind_stat_fn(
     // `StatFn` has exactly one child: the expression the aggregate statistic is computed over.
     let input = expr.child(0);
 
-    let stat_dtype = expr.return_dtype(scope)?;
-    binder.bind_aggregate(input, aggregate_fn, &stat_dtype)
+    binder.bind_aggregate(input, aggregate_fn)
 }
 
 fn null_expr(dtype: DType) -> Expression {
@@ -146,7 +160,6 @@ mod tests {
             &self,
             _input: &Expression,
             aggregate_fn: &AggregateFnRef,
-            _stat_dtype: &DType,
         ) -> VortexResult<Option<Expression>> {
             let Some(stat) = Stat::from_aggregate_fn(aggregate_fn) else {
                 return Ok(None);

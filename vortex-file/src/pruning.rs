@@ -79,7 +79,6 @@ impl StatBinder for FileStatsBinder<'_> {
         &self,
         input: &Expression,
         aggregate_fn: &AggregateFnRef,
-        _stat_dtype: &DType,
     ) -> VortexResult<Option<Expression>> {
         let Some(stat) = Stat::from_aggregate_fn(aggregate_fn) else {
             return Ok(None);
