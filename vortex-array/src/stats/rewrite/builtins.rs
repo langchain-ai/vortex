@@ -156,8 +156,8 @@ fn binary_falsify<P: NonNanProof>(
                 return Ok(None);
             }
 
-            let lhs_falsifier = ctx.falsify(lhs)?;
-            let rhs_falsifier = ctx.falsify(rhs)?;
+            let lhs_falsifier = ctx.falsify_validated(lhs)?;
+            let rhs_falsifier = ctx.falsify_validated(rhs)?;
             or_collect(lhs_falsifier.into_iter().chain(rhs_falsifier))
         }
         Operator::Or => {
@@ -165,7 +165,7 @@ fn binary_falsify<P: NonNanProof>(
                 return Ok(None);
             }
 
-            match (ctx.falsify(lhs)?, ctx.falsify(rhs)?) {
+            match (ctx.falsify_validated(lhs)?, ctx.falsify_validated(rhs)?) {
                 (Some(lhs), Some(rhs)) => Some(and(lhs, rhs)),
                 _ => None,
             }
@@ -194,7 +194,7 @@ impl StatsRewriteRule for BetweenStatsRewrite {
 
         let lhs = Binary.new_expr(options.lower_strict.to_operator(), [lower, arr.clone()]);
         let rhs = Binary.new_expr(options.upper_strict.to_operator(), [arr, upper]);
-        ctx.falsify(&and(lhs, rhs))
+        ctx.falsify_validated(&and(lhs, rhs))
     }
 }
 

@@ -107,6 +107,11 @@ impl<'a> StatsRewriteCtx<'a> {
     /// Rewrite `expr` into a stats-backed falsifier.
     pub fn falsify(&self, expr: &Expression) -> VortexResult<Option<Expression>> {
         self.ensure_predicate(expr)?;
+        self.falsify_validated(expr)
+    }
+
+    pub(crate) fn falsify_validated(&self, expr: &Expression) -> VortexResult<Option<Expression>> {
+        // Recursive rules only receive predicates whose root expression was already validated.
         rewrite(expr, self, StatsRewriteRule::falsify)
     }
 
