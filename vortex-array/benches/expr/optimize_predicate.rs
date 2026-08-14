@@ -54,6 +54,7 @@ const KIND_EXCLUDED: u8 = 2;
 enum IdPredicateShape {
     InList,
     BalancedOr,
+    ConjoinedNotEqual,
 }
 
 impl Display for IdPredicateShape {
@@ -61,6 +62,7 @@ impl Display for IdPredicateShape {
         match self {
             IdPredicateShape::InList => write!(f, "in_list"),
             IdPredicateShape::BalancedOr => write!(f, "balanced_or"),
+            IdPredicateShape::ConjoinedNotEqual => write!(f, "conjoined_not_equal"),
         }
     }
 }
@@ -126,6 +128,10 @@ const PREDICATE_CASES: &[PredicateCase] = &[
         id_count: 256,
         shape: IdPredicateShape::BalancedOr,
     },
+    PredicateCase {
+        id_count: 256,
+        shape: IdPredicateShape::ConjoinedNotEqual,
+    },
 ];
 
 fn timestamp_dtype() -> DType {
@@ -181,6 +187,9 @@ fn id_filter(ids: &[String], shape: IdPredicateShape) -> Expression {
     match shape {
         IdPredicateShape::InList => id_in_list_filter(ids),
         IdPredicateShape::BalancedOr => id_balanced_or_filter(ids),
+        IdPredicateShape::ConjoinedNotEqual => {
+            and_collect(ids.iter().map(|id| not_eq(col(FIELD_ID), lit(id.as_str())))).unwrap()
+        }
     }
 }
 

@@ -20,12 +20,19 @@ pub fn find_between(expr: Expression) -> Expression {
     // We search all pairs of cnfs to find any pair of expressions can be converted into a between
     // expression.
     let mut conjuncts = conjuncts(&expr);
+    if conjuncts.len() < 2 {
+        return expr;
+    }
     let mut rest = vec![];
 
     for idx in 0..conjuncts.len() {
         let Some(c) = conjuncts.get(idx).cloned() else {
             continue;
         };
+        if !is_between_bound(&c) {
+            rest.push(c);
+            continue;
+        }
         let mut matched = false;
         for idx2 in (idx + 1)..conjuncts.len() {
             // Since values are removed in iterations there might not be a value at idx2,
@@ -33,6 +40,9 @@ pub fn find_between(expr: Expression) -> Expression {
             let Some(c2) = conjuncts.get(idx2) else {
                 continue;
             };
+            if !is_between_bound(c2) {
+                continue;
+            }
             if let Some(expr) = maybe_match(&c, c2) {
                 rest.push(expr);
                 conjuncts.remove(idx2);
@@ -46,6 +56,13 @@ pub fn find_between(expr: Expression) -> Expression {
     }
 
     and_collect(rest).unwrap_or_else(|| lit(true))
+}
+
+fn is_between_bound(expr: &Expression) -> bool {
+    matches!(
+        expr.as_opt::<Binary>(),
+        Some(Operator::Lt | Operator::Lte | Operator::Gt | Operator::Gte)
+    )
 }
 
 fn maybe_match(lhs: &Expression, rhs: &Expression) -> Option<Expression> {
