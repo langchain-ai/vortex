@@ -52,6 +52,8 @@ use crate::stats::rewrite::StatsRewriteCtx;
 use crate::stats::rewrite::StatsRewriteRule;
 use crate::stats::session::StatsSession;
 
+const MAX_EXACT_LIST_CONTAINS_REWRITE_ELEMENTS: usize = 256;
+
 /// Register built-in stats rewrite rules.
 pub(crate) fn register_builtins(session: &StatsSession) {
     session.register_rewrite(BinaryNanCountStatsRewrite);
@@ -443,6 +445,34 @@ fn list_contains_falsify<P: NonNanProof>(
     let Some(value_min) = min(needle, ctx) else {
         return Ok(None);
     };
+
+    if elements.len() > MAX_EXACT_LIST_CONTAINS_REWRITE_ELEMENTS {
+        let mut list_min = &elements[0];
+        let mut list_max = list_min;
+        for value in &elements[1..] {
+            if value.is_null() {
+                return Ok(None);
+            }
+            if value
+                .partial_cmp(list_min)
+                .is_some_and(|ordering| ordering.is_lt())
+            {
+                list_min = value;
+            }
+            if value
+                .partial_cmp(list_max)
+                .is_some_and(|ordering| ordering.is_gt())
+            {
+                list_max = value;
+            }
+        }
+
+        let value_predicate = or(
+            lt(value_max, lit(list_min.clone())),
+            gt(value_min, lit(list_max.clone())),
+        );
+        return with_non_nan_guards::<P>(ctx, [needle], value_predicate);
+    }
 
     let value_predicate = and_collect(elements.iter().map(|value| {
         or(
@@ -1018,6 +1048,25 @@ mod tests {
                     lt(stat(col("a"), Stat::Max), lit(3i32)),
                     gt(stat(col("a"), Stat::Min), lit(3i32)),
                 ),
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounds_large_list_contains_falsifier() -> VortexResult<()> {
+        let list = Scalar::list(
+            Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable)),
+            (0..=256).map(Scalar::from).collect(),
+            Nullability::NonNullable,
+        );
+        let expr = list_contains(lit(list), col("a"));
+
+        assert_eq!(
+            falsify(&expr)?,
+            Some(or(
+                lt(stat(col("a"), Stat::Max), lit(0i32)),
+                gt(stat(col("a"), Stat::Min), lit(256i32)),
             ))
         );
         Ok(())
