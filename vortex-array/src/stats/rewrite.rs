@@ -109,7 +109,16 @@ impl<'a> StatsRewriteCtx<'a> {
     /// Rewrite `expr` into a stats-backed falsifier.
     pub fn falsify(&self, expr: &BoundExpression) -> VortexResult<Option<BoundExpression>> {
         self.ensure_predicate(expr)?;
-        self.falsify_validated(expr)
+        let cache = self.session.stats().falsifier_cache();
+        let mut cache = cache.lock();
+        let key = (expr.clone(), self.scope.clone());
+        if let Some(falsifier) = cache.get(&key) {
+            return Ok(falsifier.clone());
+        }
+
+        let falsifier = self.falsify_validated(expr)?;
+        cache.insert(key, falsifier.clone());
+        Ok(falsifier)
     }
 
     pub(crate) fn falsify_validated(
@@ -168,6 +177,10 @@ fn rewrite(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
     use vortex_error::VortexResult;
 
     use super::StatsRewriteCtx;
@@ -187,6 +200,24 @@ mod tests {
     struct StaticLiteralRule {
         falsifier: Option<BoundExpression>,
         satisfier: Option<BoundExpression>,
+    }
+
+    #[derive(Debug)]
+    struct CountingLiteralRule(Arc<AtomicUsize>);
+
+    impl StatsRewriteRule for CountingLiteralRule {
+        fn scalar_fn_id(&self) -> ScalarFnId {
+            Literal.id()
+        }
+
+        fn falsify(
+            &self,
+            _expr: &Expression,
+            _ctx: &StatsRewriteCtx<'_>,
+        ) -> VortexResult<Option<Expression>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(lit(true)))
+        }
     }
 
     impl StatsRewriteRule for StaticLiteralRule {
@@ -248,6 +279,32 @@ mod tests {
             lit(true).bind(&dtype)?.satisfy(&session)?,
             Some(or(lit(false), lit(true)).bind(&dtype)?)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn caches_falsifier_across_session_clones() -> VortexResult<()> {
+        let session = crate::array_session();
+        let calls = Arc::new(AtomicUsize::new(0));
+        session
+            .stats()
+            .register_rewrite(CountingLiteralRule(Arc::clone(&calls)));
+        let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let expr = lit(true);
+
+        assert_eq!(expr.falsify(&dtype, &session)?, Some(lit(true)));
+        assert_eq!(expr.falsify(&dtype, &session.clone())?, Some(lit(true)));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        session.stats().register_rewrite(StaticLiteralRule {
+            falsifier: Some(lit(false)),
+            satisfier: None,
+        });
+        assert_eq!(
+            expr.falsify(&dtype, &session)?,
+            Some(or(lit(true), lit(false)))
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
         Ok(())
     }
 

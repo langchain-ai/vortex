@@ -6,29 +6,35 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use parking_lot::RwLock;
 use vortex_session::SessionExt;
 use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
 use vortex_utils::aliases::hash_map::HashMap;
 
+use crate::dtype::DType;
+use crate::expr::Expression;
 use crate::scalar_fn::ScalarFnId;
 use crate::stats::rewrite::StatsRewriteRule;
 use crate::stats::rewrite::StatsRewriteRuleRef;
 use crate::stats::rewrite::register_builtins;
 
 type StatsRewriteRuleSet = Arc<[StatsRewriteRuleRef]>;
+type StatsFalsifierCache = Arc<Mutex<HashMap<(Expression, DType), Option<Expression>>>>;
 
 /// Session state for stats APIs.
 #[derive(Clone, Debug)]
 pub struct StatsSession {
     rewrite_rules: Arc<RwLock<HashMap<ScalarFnId, StatsRewriteRuleSet>>>,
+    falsifier_cache: StatsFalsifierCache,
 }
 
 impl Default for StatsSession {
     fn default() -> Self {
         let this = Self {
             rewrite_rules: Arc::new(RwLock::new(HashMap::default())),
+            falsifier_cache: Arc::new(Mutex::new(HashMap::default())),
         };
         register_builtins(&this);
         this
@@ -43,14 +49,17 @@ impl StatsSession {
 
     /// Register a shared stats rewrite rule.
     pub fn register_rewrite_ref(&self, rule: StatsRewriteRuleRef) {
-        let mut rules = self.rewrite_rules.write();
-        let rule_id = rule.scalar_fn_id();
-        let mut updated_rules = rules
-            .get(&rule_id)
-            .map(|rules| rules.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        updated_rules.push(rule);
-        rules.insert(rule_id, updated_rules.into());
+        {
+            let mut rules = self.rewrite_rules.write();
+            let rule_id = rule.scalar_fn_id();
+            let mut updated_rules = rules
+                .get(&rule_id)
+                .map(|rules| rules.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            updated_rules.push(rule);
+            rules.insert(rule_id, updated_rules.into());
+        }
+        self.falsifier_cache.lock().clear();
     }
 
     /// Return the rewrite rules registered for `scalar_fn_id`.
@@ -59,6 +68,10 @@ impl StatsSession {
         scalar_fn_id: ScalarFnId,
     ) -> Option<StatsRewriteRuleSet> {
         self.rewrite_rules.read().get(&scalar_fn_id).cloned()
+    }
+
+    pub(crate) fn falsifier_cache(&self) -> StatsFalsifierCache {
+        Arc::clone(&self.falsifier_cache)
     }
 }
 
