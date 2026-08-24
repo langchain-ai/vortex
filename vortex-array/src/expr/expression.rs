@@ -6,6 +6,7 @@ use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
+use std::hash::Hasher;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -23,12 +24,39 @@ use crate::scalar_fn::fns::root::Root;
 ///
 /// Expressions represent scalar computations that can be performed on data. Each
 /// expression consists of an encoding (vtable), heap-allocated metadata, and child expressions.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct Expression {
     /// The scalar fn for this node.
     scalar_fn: ScalarFnRef,
     /// Any children of this expression.
     children: Arc<Vec<Expression>>,
+    /// Structural hash, computed once at construction.
+    hash: u64,
+}
+
+impl PartialEq for Expression {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+            && self.scalar_fn == other.scalar_fn
+            && self.children == other.children
+    }
+}
+
+impl Eq for Expression {}
+
+impl Hash for Expression {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+fn compute_expression_hash(scalar_fn: &ScalarFnRef, children: &[Expression]) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    scalar_fn.hash(&mut hasher);
+    for child in children {
+        hasher.write_u64(child.hash);
+    }
+    hasher.finish()
 }
 
 impl Deref for Expression {
@@ -54,9 +82,11 @@ impl Expression {
             children.len()
         );
 
+        let hash = compute_expression_hash(&scalar_fn, &children);
         Ok(Self {
             scalar_fn,
             children: children.into(),
+            hash,
         })
     }
 
@@ -88,6 +118,7 @@ impl Expression {
             children.len()
         );
         self.children = Arc::new(children);
+        self.hash = compute_expression_hash(&self.scalar_fn, &self.children);
         Ok(self)
     }
 
@@ -224,5 +255,44 @@ impl Drop for Expression {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hash::DefaultHasher;
+    use std::hash::Hash;
+    use std::hash::Hasher;
+
+    use vortex_error::VortexResult;
+
+    use super::Expression;
+    use crate::expr::lit;
+    use crate::expr::not;
+    use crate::expr::root;
+
+    fn hash_of(expr: &Expression) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        expr.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn equal_expressions_have_equal_hashes() {
+        let lhs = lit(1_i32);
+        let rhs = lit(1_i32);
+
+        assert_eq!(lhs, rhs);
+        assert_eq!(hash_of(&lhs), hash_of(&rhs));
+    }
+
+    #[test]
+    fn replacing_children_updates_hash() -> VortexResult<()> {
+        let lhs = not(root()).with_children([lit(true)])?;
+        let rhs = not(lit(true));
+
+        assert_eq!(lhs, rhs);
+        assert_eq!(hash_of(&lhs), hash_of(&rhs));
+        Ok(())
     }
 }
