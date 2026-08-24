@@ -31,7 +31,7 @@ use crate::stats::rewrite::StatsRewriteCtx;
 ///
 /// Binding is purely logical: it deals only in [`DType`]s and never sees an array, a length, or an
 /// encoding.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub enum BoundExpression {
     /// A scalar function applied to bound children.
     Scalar {
@@ -44,12 +44,83 @@ pub enum BoundExpression {
         /// Sharing keeps clones cheap even though the iterative [`Drop`] implementation prevents
         /// consumers from destructuring a `BoundExpression` by value.
         children: Arc<Vec<BoundExpression>>,
+        /// Structural hash, computed once at construction.
+        hash: u64,
     },
     /// The scope itself. Its dtype is the scope's root dtype.
     Root {
         /// The dtype this node evaluates to.
         dtype: DType,
+        /// Structural hash, computed once at construction.
+        hash: u64,
     },
+}
+
+impl PartialEq for BoundExpression {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Root {
+                    dtype: lhs_dtype,
+                    hash: lhs_hash,
+                },
+                Self::Root {
+                    dtype: rhs_dtype,
+                    hash: rhs_hash,
+                },
+            ) => lhs_hash == rhs_hash && lhs_dtype == rhs_dtype,
+            (
+                Self::Scalar {
+                    dtype: lhs_dtype,
+                    scalar_fn: lhs_fn,
+                    children: lhs_children,
+                    hash: lhs_hash,
+                },
+                Self::Scalar {
+                    dtype: rhs_dtype,
+                    scalar_fn: rhs_fn,
+                    children: rhs_children,
+                    hash: rhs_hash,
+                },
+            ) => {
+                lhs_hash == rhs_hash
+                    && lhs_dtype == rhs_dtype
+                    && lhs_fn == rhs_fn
+                    && lhs_children == rhs_children
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for BoundExpression {}
+
+impl Hash for BoundExpression {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.structural_hash());
+    }
+}
+
+fn compute_root_hash(dtype: &DType) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write_u8(0);
+    dtype.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn compute_scalar_hash(
+    dtype: &DType,
+    scalar_fn: &ScalarFnRef,
+    children: &[BoundExpression],
+) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write_u8(1);
+    dtype.hash(&mut hasher);
+    scalar_fn.hash(&mut hasher);
+    for child in children {
+        hasher.write_u64(child.structural_hash());
+    }
+    hasher.finish()
 }
 
 /// A bound-expression wrapper that compares shared tree identity instead of structure.
@@ -60,19 +131,25 @@ impl PartialEq for ExactBoundExpr {
     fn eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
             (
-                BoundExpression::Root { dtype: lhs_dtype },
-                BoundExpression::Root { dtype: rhs_dtype },
+                BoundExpression::Root {
+                    dtype: lhs_dtype, ..
+                },
+                BoundExpression::Root {
+                    dtype: rhs_dtype, ..
+                },
             ) => lhs_dtype == rhs_dtype,
             (
                 BoundExpression::Scalar {
                     dtype: lhs_dtype,
                     scalar_fn: lhs_fn,
                     children: lhs_children,
+                    ..
                 },
                 BoundExpression::Scalar {
                     dtype: rhs_dtype,
                     scalar_fn: rhs_fn,
                     children: rhs_children,
+                    ..
                 },
             ) => {
                 lhs_fn == rhs_fn
@@ -108,7 +185,8 @@ impl Hash for ExactBoundExpr {
 impl BoundExpression {
     /// Create a bound root expression with the given dtype.
     pub fn new_root(dtype: DType) -> Self {
-        Self::Root { dtype }
+        let hash = compute_root_hash(&dtype);
+        Self::Root { dtype, hash }
     }
 
     /// Create a bound scalar node from a scalar function and already-bound children.
@@ -132,11 +210,13 @@ impl BoundExpression {
             .map(|child| child.dtype().clone())
             .collect_vec();
         let dtype = scalar_fn.return_dtype(&arg_dtypes)?;
+        let hash = compute_scalar_hash(&dtype, &scalar_fn, &children);
 
         Ok(Self::Scalar {
             dtype,
             scalar_fn,
             children: children.into(),
+            hash,
         })
     }
 
@@ -161,7 +241,13 @@ impl BoundExpression {
     /// The dtype this expression evaluates to.
     pub fn dtype(&self) -> &DType {
         match self {
-            Self::Scalar { dtype, .. } | Self::Root { dtype } => dtype,
+            Self::Scalar { dtype, .. } | Self::Root { dtype, .. } => dtype,
+        }
+    }
+
+    fn structural_hash(&self) -> u64 {
+        match self {
+            Self::Scalar { hash, .. } | Self::Root { hash, .. } => *hash,
         }
     }
 

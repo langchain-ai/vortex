@@ -13,15 +13,14 @@ use vortex_session::SessionGuard;
 use vortex_session::SessionVar;
 use vortex_utils::aliases::hash_map::HashMap;
 
-use crate::dtype::DType;
-use crate::expr::Expression;
+use crate::expr::BoundExpression;
 use crate::scalar_fn::ScalarFnId;
 use crate::stats::rewrite::StatsRewriteRule;
 use crate::stats::rewrite::StatsRewriteRuleRef;
 use crate::stats::rewrite::register_builtins;
 
 type StatsRewriteRuleSet = Arc<[StatsRewriteRuleRef]>;
-type StatsFalsifierCache = Arc<Mutex<HashMap<(Expression, DType), Option<Expression>>>>;
+type StatsFalsifierCache = Arc<Mutex<HashMap<BoundExpression, Option<BoundExpression>>>>;
 
 /// Session state for stats APIs.
 #[derive(Clone, Debug)]

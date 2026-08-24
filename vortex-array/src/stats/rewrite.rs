@@ -111,7 +111,7 @@ impl<'a> StatsRewriteCtx<'a> {
         self.ensure_predicate(expr)?;
         let cache = self.session.stats().falsifier_cache();
         let mut cache = cache.lock();
-        let key = (expr.clone(), self.scope.clone());
+        let key = expr.clone();
         if let Some(falsifier) = cache.get(&key) {
             return Ok(falsifier.clone());
         }
@@ -212,11 +212,11 @@ mod tests {
 
         fn falsify(
             &self,
-            _expr: &Expression,
+            expr: &BoundExpression,
             _ctx: &StatsRewriteCtx<'_>,
-        ) -> VortexResult<Option<Expression>> {
+        ) -> VortexResult<Option<BoundExpression>> {
             self.0.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(lit(true)))
+            Ok(Some(lit(true).bind(expr.dtype())?))
         }
     }
 
@@ -290,19 +290,22 @@ mod tests {
             .stats()
             .register_rewrite(CountingLiteralRule(Arc::clone(&calls)));
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let expr = lit(true);
+        let expr = lit(true).bind(&dtype)?;
 
-        assert_eq!(expr.falsify(&dtype, &session)?, Some(lit(true)));
-        assert_eq!(expr.falsify(&dtype, &session.clone())?, Some(lit(true)));
+        assert_eq!(expr.falsify(&session)?, Some(lit(true).bind(&dtype)?));
+        assert_eq!(
+            expr.falsify(&session.clone())?,
+            Some(lit(true).bind(&dtype)?)
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
         session.stats().register_rewrite(StaticLiteralRule {
-            falsifier: Some(lit(false)),
+            falsifier: Some(lit(false).bind(&dtype)?),
             satisfier: None,
         });
         assert_eq!(
-            expr.falsify(&dtype, &session)?,
-            Some(or(lit(true), lit(false)))
+            expr.falsify(&session)?,
+            Some(or(lit(true), lit(false)).bind(&dtype)?)
         );
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         Ok(())

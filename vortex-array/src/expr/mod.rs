@@ -167,10 +167,12 @@ impl PartialEq for ExactExpr {
                 Expression::Scalar {
                     scalar_fn: lhs_fn,
                     children: lhs_children,
+                    ..
                 },
                 Expression::Scalar {
                     scalar_fn: rhs_fn,
                     children: rhs_children,
+                    ..
                 },
             ) => lhs_fn == rhs_fn && Arc::ptr_eq(lhs_children, rhs_children),
             _ => false,
@@ -186,6 +188,7 @@ impl Hash for ExactExpr {
             Expression::Scalar {
                 scalar_fn,
                 children,
+                ..
             } => {
                 state.write_u8(1);
                 scalar_fn.hash(state);

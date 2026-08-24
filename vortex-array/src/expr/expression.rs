@@ -6,6 +6,7 @@ use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -29,7 +30,7 @@ const NO_CHILDREN: &[Expression] = &[];
 /// itself: a language primitive rather than a registered function, because its dtype comes from the
 /// scope rather than from children and it is not executable. A [`ScalarFnVTable`] can answer neither
 /// of those, so `Root` is a variant instead.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub enum Expression {
     /// A scalar function applied to child expressions.
     Scalar {
@@ -37,9 +38,50 @@ pub enum Expression {
         scalar_fn: ScalarFnRef,
         /// Any children of this expression.
         children: Arc<Vec<Expression>>,
+        /// Structural hash, computed once at construction.
+        hash: u64,
     },
     /// The full scope of the expression evaluation.
     Root,
+}
+
+impl PartialEq for Expression {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Root, Self::Root) => true,
+            (
+                Self::Scalar {
+                    scalar_fn: lhs_fn,
+                    children: lhs_children,
+                    hash: lhs_hash,
+                },
+                Self::Scalar {
+                    scalar_fn: rhs_fn,
+                    children: rhs_children,
+                    hash: rhs_hash,
+                },
+            ) => lhs_hash == rhs_hash && lhs_fn == rhs_fn && lhs_children == rhs_children,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Expression {}
+
+impl Hash for Expression {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.structural_hash());
+    }
+}
+
+fn compute_expression_hash(scalar_fn: &ScalarFnRef, children: &[Expression]) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write_u8(1);
+    scalar_fn.hash(&mut hasher);
+    for child in children {
+        hasher.write_u64(child.structural_hash());
+    }
+    hasher.finish()
 }
 
 impl Expression {
@@ -57,9 +99,11 @@ impl Expression {
             children.len()
         );
 
+        let hash = compute_expression_hash(&scalar_fn, &children);
         Ok(Self::Scalar {
             scalar_fn,
             children: children.into(),
+            hash,
         })
     }
 
@@ -109,6 +153,13 @@ impl Expression {
         &self.children()[n]
     }
 
+    fn structural_hash(&self) -> u64 {
+        match self {
+            Self::Scalar { hash, .. } => *hash,
+            Self::Root => 0,
+        }
+    }
+
     /// Replace the children of this expression with the provided new children.
     pub fn with_children(
         self,
@@ -131,9 +182,11 @@ impl Expression {
                     scalar_fn.signature().arity(),
                     children.len()
                 );
+                let hash = compute_expression_hash(scalar_fn, &children);
                 Ok(Self::Scalar {
                     scalar_fn: scalar_fn.clone(),
                     children: children.into(),
+                    hash,
                 })
             }
         }
@@ -146,6 +199,7 @@ impl Expression {
             Self::Scalar {
                 scalar_fn,
                 children,
+                ..
             } => {
                 let dtypes: Vec<_> = children
                     .iter()
@@ -284,5 +338,44 @@ impl Drop for Expression {
                 children_to_drop.append(expr_children);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hash::DefaultHasher;
+    use std::hash::Hash;
+    use std::hash::Hasher;
+
+    use vortex_error::VortexResult;
+
+    use super::Expression;
+    use crate::expr::lit;
+    use crate::expr::not;
+    use crate::expr::root;
+
+    fn hash_of(expr: &Expression) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        expr.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn equal_expressions_have_equal_hashes() {
+        let lhs = lit(1_i32);
+        let rhs = lit(1_i32);
+
+        assert_eq!(lhs, rhs);
+        assert_eq!(hash_of(&lhs), hash_of(&rhs));
+    }
+
+    #[test]
+    fn replacing_children_updates_hash() -> VortexResult<()> {
+        let lhs = not(root()).with_children([lit(true)])?;
+        let rhs = not(lit(true));
+
+        assert_eq!(lhs, rhs);
+        assert_eq!(hash_of(&lhs), hash_of(&rhs));
+        Ok(())
     }
 }
