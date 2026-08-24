@@ -24,6 +24,8 @@ use crate::scalar_fn::ScalarFnVTable;
 /// An empty child slice, returned by [`Expression::children`] for childless variants.
 const NO_CHILDREN: &[Expression] = &[];
 
+const ITERATIVE_DROP_DEPTH: u8 = 64;
+
 /// A node in a Vortex expression tree.
 ///
 /// Most nodes are a scalar function applied to child expressions. [`Expression::Root`] is the scope
@@ -40,6 +42,8 @@ pub enum Expression {
         children: Arc<Vec<Expression>>,
         /// Structural hash, computed once at construction.
         hash: u64,
+        /// Tree depth, capped at the depth where destruction becomes iterative.
+        drop_depth: u8,
     },
     /// The full scope of the expression evaluation.
     Root,
@@ -54,11 +58,13 @@ impl PartialEq for Expression {
                     scalar_fn: lhs_fn,
                     children: lhs_children,
                     hash: lhs_hash,
+                    ..
                 },
                 Self::Scalar {
                     scalar_fn: rhs_fn,
                     children: rhs_children,
                     hash: rhs_hash,
+                    ..
                 },
             ) => lhs_hash == rhs_hash && lhs_fn == rhs_fn && lhs_children == rhs_children,
             _ => false,
@@ -84,6 +90,15 @@ fn compute_expression_hash(scalar_fn: &ScalarFnRef, children: &[Expression]) -> 
     hasher.finish()
 }
 
+fn compute_drop_depth(children: &[Expression]) -> u8 {
+    children
+        .iter()
+        .map(Expression::drop_depth)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .min(ITERATIVE_DROP_DEPTH)
+}
 impl Expression {
     /// Create a new expression node from a scalar_fn expression and its children.
     pub fn try_new(
@@ -100,10 +115,12 @@ impl Expression {
         );
 
         let hash = compute_expression_hash(&scalar_fn, &children);
+        let drop_depth = compute_drop_depth(&children);
         Ok(Self::Scalar {
             scalar_fn,
             children: children.into(),
             hash,
+            drop_depth,
         })
     }
 
@@ -160,6 +177,13 @@ impl Expression {
         }
     }
 
+    fn drop_depth(&self) -> u8 {
+        match self {
+            Self::Scalar { drop_depth, .. } => *drop_depth,
+            Self::Root => 0,
+        }
+    }
+
     /// Replace the children of this expression with the provided new children.
     pub fn with_children(
         self,
@@ -183,10 +207,12 @@ impl Expression {
                     children.len()
                 );
                 let hash = compute_expression_hash(scalar_fn, &children);
+                let drop_depth = compute_drop_depth(&children);
                 Ok(Self::Scalar {
                     scalar_fn: scalar_fn.clone(),
                     children: children.into(),
                     hash,
+                    drop_depth,
                 })
             }
         }
@@ -323,18 +349,35 @@ impl Display for Expression {
 /// Iterative drop for expression to avoid stack overflows.
 impl Drop for Expression {
     fn drop(&mut self) {
-        let Self::Scalar { children, .. } = self else {
+        let Self::Scalar {
+            children,
+            drop_depth,
+            ..
+        } = self
+        else {
             return;
         };
+        if *drop_depth < ITERATIVE_DROP_DEPTH {
+            return;
+        }
         let Some(children) = Arc::get_mut(children) else {
             return;
         };
 
         let mut children_to_drop = std::mem::take(children);
         while let Some(mut child) = children_to_drop.pop() {
-            if let Self::Scalar { children, .. } = &mut child
-                && let Some(expr_children) = Arc::get_mut(children)
-            {
+            let Self::Scalar {
+                children,
+                drop_depth,
+                ..
+            } = &mut child
+            else {
+                continue;
+            };
+            if *drop_depth < ITERATIVE_DROP_DEPTH {
+                continue;
+            }
+            if let Some(expr_children) = Arc::get_mut(children) {
                 children_to_drop.append(expr_children);
             }
         }
@@ -377,5 +420,11 @@ mod tests {
         assert_eq!(lhs, rhs);
         assert_eq!(hash_of(&lhs), hash_of(&rhs));
         Ok(())
+    }
+
+    #[test]
+    fn dropping_deep_expression_is_stack_safe() {
+        let expression = (0..100_000).fold(root(), |expr, _| not(expr));
+        drop(expression);
     }
 }

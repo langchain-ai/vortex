@@ -24,6 +24,8 @@ use crate::scalar_fn::ScalarFnRef;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::stats::rewrite::StatsRewriteCtx;
 
+const ITERATIVE_DROP_DEPTH: u8 = 64;
+
 /// An [`Expression`] that has been type-checked against a [`Scope`].
 ///
 /// Every node carries its own dtype, so reading one is a field access rather than a walk of the
@@ -46,6 +48,8 @@ pub enum BoundExpression {
         children: Arc<Vec<BoundExpression>>,
         /// Structural hash, computed once at construction.
         hash: u64,
+        /// Tree depth, capped at the depth where destruction becomes iterative.
+        drop_depth: u8,
     },
     /// The scope itself. Its dtype is the scope's root dtype.
     Root {
@@ -75,12 +79,14 @@ impl PartialEq for BoundExpression {
                     scalar_fn: lhs_fn,
                     children: lhs_children,
                     hash: lhs_hash,
+                    ..
                 },
                 Self::Scalar {
                     dtype: rhs_dtype,
                     scalar_fn: rhs_fn,
                     children: rhs_children,
                     hash: rhs_hash,
+                    ..
                 },
             ) => {
                 lhs_hash == rhs_hash
@@ -121,6 +127,16 @@ fn compute_scalar_hash(
         hasher.write_u64(child.structural_hash());
     }
     hasher.finish()
+}
+
+fn compute_drop_depth(children: &[BoundExpression]) -> u8 {
+    children
+        .iter()
+        .map(BoundExpression::drop_depth)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .min(ITERATIVE_DROP_DEPTH)
 }
 
 /// A bound-expression wrapper that compares shared tree identity instead of structure.
@@ -211,12 +227,14 @@ impl BoundExpression {
             .collect_vec();
         let dtype = scalar_fn.return_dtype(&arg_dtypes)?;
         let hash = compute_scalar_hash(&dtype, &scalar_fn, &children);
+        let drop_depth = compute_drop_depth(&children);
 
         Ok(Self::Scalar {
             dtype,
             scalar_fn,
             children: children.into(),
             hash,
+            drop_depth,
         })
     }
 
@@ -248,6 +266,13 @@ impl BoundExpression {
     fn structural_hash(&self) -> u64 {
         match self {
             Self::Scalar { hash, .. } | Self::Root { hash, .. } => *hash,
+        }
+    }
+
+    fn drop_depth(&self) -> u8 {
+        match self {
+            Self::Scalar { drop_depth, .. } => *drop_depth,
+            Self::Root { .. } => 0,
         }
     }
 
@@ -382,18 +407,35 @@ impl Expression {
 /// Iterative drop to avoid stack overflows on deep trees.
 impl Drop for BoundExpression {
     fn drop(&mut self) {
-        let Self::Scalar { children, .. } = self else {
+        let Self::Scalar {
+            children,
+            drop_depth,
+            ..
+        } = self
+        else {
             return;
         };
+        if *drop_depth < ITERATIVE_DROP_DEPTH {
+            return;
+        }
         let Some(children) = Arc::get_mut(children) else {
             return;
         };
 
         let mut to_drop = std::mem::take(children);
         while let Some(mut child) = to_drop.pop() {
-            if let BoundExpression::Scalar { children, .. } = &mut child
-                && let Some(grandchildren) = Arc::get_mut(children)
-            {
+            let BoundExpression::Scalar {
+                children,
+                drop_depth,
+                ..
+            } = &mut child
+            else {
+                continue;
+            };
+            if *drop_depth < ITERATIVE_DROP_DEPTH {
+                continue;
+            }
+            if let Some(grandchildren) = Arc::get_mut(children) {
                 to_drop.append(grandchildren);
             }
         }
