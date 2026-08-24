@@ -20,6 +20,8 @@ use crate::expr::display::DisplayTreeExpr;
 use crate::scalar_fn::ScalarFnRef;
 use crate::scalar_fn::fns::root::Root;
 
+const ITERATIVE_DROP_DEPTH: u8 = 64;
+
 /// A node in a Vortex expression tree.
 ///
 /// Expressions represent scalar computations that can be performed on data. Each
@@ -32,6 +34,8 @@ pub struct Expression {
     children: Arc<Vec<Expression>>,
     /// Structural hash, computed once at construction.
     hash: u64,
+    /// Tree depth, capped at the depth where destruction becomes iterative.
+    drop_depth: u8,
 }
 
 impl PartialEq for Expression {
@@ -59,6 +63,16 @@ fn compute_expression_hash(scalar_fn: &ScalarFnRef, children: &[Expression]) -> 
     hasher.finish()
 }
 
+fn compute_drop_depth(children: &[Expression]) -> u8 {
+    children
+        .iter()
+        .map(|child| child.drop_depth)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .min(ITERATIVE_DROP_DEPTH)
+}
+
 impl Deref for Expression {
     type Target = ScalarFnRef;
 
@@ -83,10 +97,12 @@ impl Expression {
         );
 
         let hash = compute_expression_hash(&scalar_fn, &children);
+        let drop_depth = compute_drop_depth(&children);
         Ok(Self {
             scalar_fn,
             children: children.into(),
             hash,
+            drop_depth,
         })
     }
 
@@ -119,6 +135,7 @@ impl Expression {
         );
         self.children = Arc::new(children);
         self.hash = compute_expression_hash(&self.scalar_fn, &self.children);
+        self.drop_depth = compute_drop_depth(&self.children);
         Ok(self)
     }
 
@@ -246,10 +263,18 @@ impl Display for Expression {
 /// Iterative drop for expression to avoid stack overflows.
 impl Drop for Expression {
     fn drop(&mut self) {
+        if self.drop_depth < ITERATIVE_DROP_DEPTH {
+            return;
+        }
+
         if let Some(children) = Arc::get_mut(&mut self.children) {
             let mut children_to_drop = std::mem::take(children);
 
             while let Some(mut child) = children_to_drop.pop() {
+                if child.drop_depth < ITERATIVE_DROP_DEPTH {
+                    continue;
+                }
+
                 if let Some(expr_children) = Arc::get_mut(&mut child.children) {
                     children_to_drop.append(expr_children);
                 }
@@ -294,5 +319,11 @@ mod tests {
         assert_eq!(lhs, rhs);
         assert_eq!(hash_of(&lhs), hash_of(&rhs));
         Ok(())
+    }
+
+    #[test]
+    fn dropping_deep_expression_is_stack_safe() {
+        let expression = (0..100_000).fold(root(), |expr, _| not(expr));
+        drop(expression);
     }
 }
