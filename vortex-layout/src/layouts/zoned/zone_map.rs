@@ -323,7 +323,10 @@ impl ZoneMapStatsBinder<'_> {
     }
 
     fn has_field(&self, name: &str) -> bool {
-        self.stats_table_dtype.as_struct_fields().find(name).is_some()
+        self.stats_table_dtype
+            .as_struct_fields()
+            .find(name)
+            .is_some()
     }
 }
 

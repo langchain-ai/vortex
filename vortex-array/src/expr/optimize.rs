@@ -153,8 +153,15 @@ impl Expression {
         if let Some(new_children) = new_children {
             let updated = expr.clone().with_children(new_children)?;
 
-            // After updating children, try to optimize root again
-            current = Some(updated.try_optimize(cache)?.unwrap_or(updated));
+            // After updating children, try to optimize the root again. A root rewrite can
+            // introduce new children, so recursively optimize its replacement as well.
+            current = Some(if let Some(optimized) = updated.try_optimize(cache)? {
+                optimized
+                    .try_optimize_recursive_inner(cache)?
+                    .unwrap_or(optimized)
+            } else {
+                updated
+            });
         }
 
         Ok(current)
@@ -210,6 +217,7 @@ mod tests {
     use vortex_error::vortex_err;
 
     use crate::dtype::DType;
+    use crate::dtype::FieldName;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::dtype::StructFields;
@@ -218,8 +226,13 @@ mod tests {
     use crate::expr::get_item;
     use crate::expr::lit;
     use crate::expr::lt_eq;
+    use crate::expr::merge;
     use crate::expr::or;
+    use crate::expr::pack;
     use crate::expr::root;
+    use crate::expr::select;
+    use crate::expr::transform::replace;
+    use crate::expr::transform::replace_root_fields;
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::literal::Literal;
 
@@ -270,6 +283,42 @@ mod tests {
             .as_opt::<Literal>()
             .ok_or_else(|| vortex_err!("expected a bare literal RHS, got {optimized}"))?;
         assert_eq!(rhs, &Scalar::primitive(3.0f64, Nullability::NonNullable));
+        Ok(())
+    }
+
+    #[test]
+    fn optimize_children_introduced_by_parent_rewrite() -> VortexResult<()> {
+        let field_names = (0..40)
+            .map(|idx| FieldName::from(format!("field_{idx}")))
+            .collect::<Vec<_>>();
+        let fields = StructFields::new(
+            field_names.clone().into(),
+            (0..40)
+                .map(|_| DType::Primitive(PType::U64, Nullability::NonNullable))
+                .collect(),
+        );
+        let scope = DType::Struct(fields.clone(), Nullability::NonNullable);
+        let expr = select(
+            field_names
+                .into_iter()
+                .chain(["input_row_idx".into(), "input_file_idx".into()])
+                .collect::<Vec<_>>(),
+            merge([
+                root(),
+                pack(
+                    [
+                        ("input_row_idx", lit(0_u64)),
+                        ("input_file_idx", lit(1_u64)),
+                    ],
+                    Nullability::NonNullable,
+                ),
+            ]),
+        );
+        let expr = replace(expr, &root(), replace_root_fields(root(), &fields));
+
+        let optimized = expr.optimize_recursive(&scope)?;
+        assert_eq!(optimized.optimize_recursive(&scope)?, optimized);
+
         Ok(())
     }
 }
