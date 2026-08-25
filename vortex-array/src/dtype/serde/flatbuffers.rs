@@ -263,12 +263,12 @@ impl TryFrom<ViewedDType> for DType {
                 let storage_dtype = DType::try_from(storage_view)
                     .map_err(|e| vortex_err!("failed to create DType from fbs message: {e}"))?;
 
+                // Older files omitted metadata for extensions without any metadata. The current
+                // extension contract represents that state as an empty byte slice.
                 let metadata = fb_ext
                     .metadata()
-                    .ok_or_else(|| {
-                        vortex_err!("failed to parse extension metadata from flatbuffer")
-                    })?
-                    .bytes();
+                    .map(|metadata| metadata.bytes())
+                    .unwrap_or_default();
                 let ext_dtype = if let Some(vtable) = vfdt.session.dtypes().registry().find(&id) {
                     vtable.deserialize(metadata, storage_dtype)?
                 } else if vfdt.session.allows_unknown() {
@@ -497,18 +497,25 @@ impl TryFrom<fb::PType> for PType {
 mod test {
     use std::sync::Arc;
 
+    use flatbuffers::FlatBufferBuilder;
     use flatbuffers::root;
+    use vortex_buffer::ByteBuffer;
+    use vortex_error::VortexResult;
     use vortex_flatbuffers::FlatBuffer;
+    use vortex_flatbuffers::WriteFlatBuffer;
     use vortex_flatbuffers::WriteFlatBufferExt;
 
     use crate::dtype::DType;
     use crate::dtype::PType;
     use crate::dtype::StructFields;
     use crate::dtype::UnionVariants;
+    use crate::dtype::extension::ExtDType;
     use crate::dtype::flatbuffers as fb;
     use crate::dtype::nullability::Nullability;
     use crate::dtype::serde::flatbuffers::ViewedDType;
     use crate::dtype::test::SESSION;
+    use crate::extension::uuid::Uuid;
+    use crate::extension::uuid::UuidMetadata;
 
     fn roundtrip_dtype(dtype: DType) {
         let bytes = dtype.write_flatbuffer_bytes().unwrap();
@@ -590,6 +597,46 @@ mod test {
             .unwrap(),
         );
         roundtrip_dtype(dtype);
+    }
+
+    #[test]
+    fn deserialize_extension_without_metadata_as_empty() -> VortexResult<()> {
+        let mut fbb = FlatBufferBuilder::new();
+        let id = fbb.create_string("vortex.uuid");
+        let storage_dtype = DType::FixedSizeList(
+            Arc::new(DType::Primitive(PType::U8, Nullability::NonNullable)),
+            16,
+            Nullability::NonNullable,
+        );
+        let storage_dtype_offset = storage_dtype.write_flatbuffer(&mut fbb)?;
+        let extension = fb::Extension::create(
+            &mut fbb,
+            &fb::ExtensionArgs {
+                id: Some(id),
+                storage_dtype: Some(storage_dtype_offset),
+                metadata: None,
+            },
+        );
+        let dtype = fb::DType::create(
+            &mut fbb,
+            &fb::DTypeArgs {
+                type_type: fb::Type::Extension,
+                type_: Some(extension.as_union_value()),
+            },
+        );
+        fbb.finish_minimal(dtype);
+        let (bytes, start) = fbb.collapse();
+        let end = bytes.len();
+        let buffer = FlatBuffer::align_from(ByteBuffer::from(bytes).slice(start..end));
+        let root_fb = root::<fb::DType>(&buffer)?;
+        let view = ViewedDType::from_fb_loc(root_fb._tab.loc(), buffer, SESSION.clone());
+
+        let actual = DType::try_from(view)?;
+        let expected = DType::Extension(
+            ExtDType::try_with_vtable(Uuid, UuidMetadata::default(), storage_dtype)?.erased(),
+        );
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[test]
