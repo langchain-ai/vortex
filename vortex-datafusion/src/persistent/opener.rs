@@ -62,6 +62,7 @@ use crate::metrics::PARTITION_LABEL;
 use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
 use crate::persistent::reader::VortexReaderFactory;
+use crate::persistent::resolver::LayoutReaderResolver;
 use crate::persistent::stream::PrunableStream;
 
 #[derive(Clone)]
@@ -102,6 +103,7 @@ pub(crate) struct VortexOpener {
 
     pub expression_convertor: Arc<dyn ExpressionConvertor>,
     pub file_metadata_cache: Option<Arc<dyn FileMetadataCache>>,
+    pub layout_reader_resolver: Option<Arc<dyn LayoutReaderResolver>>,
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
     pub scan_concurrency: Option<usize>,
@@ -125,14 +127,11 @@ impl FileOpener for VortexOpener {
         let mut projection = self.projection.clone();
         let mut filter = self.filter.clone();
 
-        let reader = self.vortex_reader_factory.create_reader(&file, &session)?;
-
-        let reader =
-            InstrumentedReadAt::new_with_labels(reader, metrics_registry.as_ref(), labels.clone());
-
         let mut file_pruning_predicate = self.file_pruning_predicate.clone();
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
         let file_metadata_cache = self.file_metadata_cache.clone();
+        let layout_reader_resolver = self.layout_reader_resolver.clone();
+        let vortex_reader_factory = Arc::clone(&self.vortex_reader_factory);
 
         let unified_file_schema = Arc::clone(self.table_schema.file_schema());
         let limit = self.limit;
@@ -208,57 +207,103 @@ impl FileOpener for VortexOpener {
                 return Ok(stream::empty().boxed());
             }
 
-            let mut open_opts = session
-                .open_options()
-                .with_file_size(file.object_meta.size)
-                .with_metrics_registry(Arc::clone(&metrics_registry))
-                .with_labels(labels);
-
-            let cached_footer = file_metadata_cache
-                .as_ref()
-                .and_then(|cache| cache.get(file.path()))
-                .filter(|entry| entry.is_valid_for(&file.object_meta))
-                .and_then(|entry| {
-                    entry
-                        .file_metadata
-                        .as_any()
-                        .downcast_ref::<CachedVortexMetadata>()
-                        .map(|vortex_metadata| vortex_metadata.footer().clone())
-                });
-            let footer_cache_hit = cached_footer.is_some();
-
-            if let Some(footer) = cached_footer {
-                open_opts = open_opts.with_footer(footer);
-            }
-
-            let vxf = open_opts
-                .open_read(reader)
-                .await
-                .map_err(|e| exec_datafusion_err!("Failed to open Vortex file {e}"))?;
-
-            // On a miss, cache the parsed footer so other partitions and later executions
-            // skip the footer fetch and parse. `infer_schema`/`infer_stats` also populate
-            // this cache, but only when planning goes through `VortexFormat`.
-            if !footer_cache_hit && let Some(cache) = &file_metadata_cache {
-                cache.put(
-                    file.path(),
-                    CachedFileMetadataEntry::new(
-                        file.object_meta.clone(),
-                        Arc::new(CachedVortexMetadata::new(&vxf)),
-                    ),
+            // Resolve the layout before adapting expressions. Custom resolvers may expose logical
+            // fields that are not present in the core file, such as external index-backed fields.
+            // A custom resolver owns file opening and caching, so the default open path must not
+            // fetch the footer first.
+            let layout_reader = if let Some(resolver) = layout_reader_resolver {
+                let reader = resolver.resolve(&session, &file).await?;
+                if reader.row_count() == 0 {
+                    return Ok(stream::empty().boxed());
+                }
+                reader
+            } else {
+                let reader = vortex_reader_factory.create_reader(&file, &session)?;
+                let reader = InstrumentedReadAt::new_with_labels(
+                    reader,
+                    metrics_registry.as_ref(),
+                    labels.clone(),
                 );
-            }
+                let mut open_opts = session
+                    .open_options()
+                    .with_file_size(file.object_meta.size)
+                    .with_metrics_registry(Arc::clone(&metrics_registry))
+                    .with_labels(labels);
 
-            // Check if there are rows in this file. If not, we can save
-            // ourselves some work and return an empty stream.
-            if vxf.row_count() == 0 {
-                return Ok(stream::empty().boxed());
-            }
+                let cached_footer = file_metadata_cache
+                    .as_ref()
+                    .and_then(|cache| cache.get(file.path()))
+                    .filter(|entry| entry.is_valid_for(&file.object_meta))
+                    .and_then(|entry| {
+                        entry
+                            .file_metadata
+                            .as_any()
+                            .downcast_ref::<CachedVortexMetadata>()
+                            .map(|vortex_metadata| vortex_metadata.footer().clone())
+                    });
+                let footer_cache_hit = cached_footer.is_some();
+
+                if let Some(footer) = cached_footer {
+                    open_opts = open_opts.with_footer(footer);
+                }
+
+                let vxf = open_opts
+                    .open_read(reader)
+                    .await
+                    .map_err(|e| exec_datafusion_err!("Failed to open Vortex file {e}"))?;
+
+                // On a miss, cache the parsed footer so other partitions and later executions
+                // skip the footer fetch and parse. `infer_schema`/`infer_stats` also populate
+                // this cache, but only when planning goes through `VortexFormat`.
+                if !footer_cache_hit && let Some(cache) = &file_metadata_cache {
+                    cache.put(
+                        file.path(),
+                        CachedFileMetadataEntry::new(
+                            file.object_meta.clone(),
+                            Arc::new(CachedVortexMetadata::new(&vxf)),
+                        ),
+                    );
+                }
+
+                // Check if there are rows in this file. If not, we can save
+                // ourselves some work and return an empty stream.
+                if vxf.row_count() == 0 {
+                    return Ok(stream::empty().boxed());
+                }
+
+                match layout_readers.entry(file.object_meta.location.clone()) {
+                    Entry::Occupied(mut occupied_entry) => {
+                        if let Some(reader) = occupied_entry.get().upgrade() {
+                            tracing::trace!("reusing layout reader for {}", occupied_entry.key());
+                            reader
+                        } else {
+                            tracing::trace!("creating layout reader for {}", occupied_entry.key());
+                            let reader = vxf.layout_reader().map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to create layout reader: {e}"
+                                ))
+                            })?;
+                            occupied_entry.insert(Arc::downgrade(&reader));
+                            reader
+                        }
+                    }
+                    Entry::Vacant(vacant_entry) => {
+                        tracing::trace!("creating layout reader for {}", vacant_entry.key());
+                        let reader = vxf.layout_reader().map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to create layout reader: {e}"
+                            ))
+                        })?;
+                        vacant_entry.insert(Arc::downgrade(&reader));
+                        reader
+                    }
+                }
+            };
 
             // This is the expected arrow types of the actual columns in the file, which might have different types
             // from the unified logical schema or miss
             let this_file_schema = Arc::new(calculate_physical_schema(
-                vxf.dtype(),
+                layout_reader.dtype(),
                 &unified_file_schema,
                 &session.arrow(),
             )?);
@@ -296,12 +341,11 @@ impl FileOpener for VortexOpener {
                 // and apply the full projection after the scan.
                 expr_convertor.no_pushdown_projection(projection.clone(), &this_file_schema)?
             };
-
             // The schema of the stream returned from the vortex scan.
             // We use a reference schema for types that don't roundtrip (Dictionary, Utf8, etc.).
             let scan_projection = scan_projection
-                .optimize_recursive(vxf.dtype())
-                .and_then(|projection| projection.bind(vxf.dtype()))
+                .optimize_recursive(layout_reader.dtype())
+                .and_then(|projection| projection.bind(layout_reader.dtype()))
                 .map_err(|_e| {
                     exec_datafusion_err!("Couldn't get the dtype for the underlying Vortex scan")
                 })?;
@@ -326,34 +370,6 @@ impl FileOpener for VortexOpener {
             let leftover_projection = leftover_projection
                 .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
             let projector = leftover_projection.make_projector(&stream_schema)?;
-
-            // We share our layout readers with others partitions in the scan, so we can only need to read each layout in each file once.
-            let layout_reader = match layout_readers.entry(file.object_meta.location.clone()) {
-                Entry::Occupied(mut occupied_entry) => {
-                    if let Some(reader) = occupied_entry.get().upgrade() {
-                        tracing::trace!("reusing layout reader for {}", occupied_entry.key());
-                        reader
-                    } else {
-                        tracing::trace!("creating layout reader for {}", occupied_entry.key());
-                        let reader = vxf.layout_reader().map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to create layout reader: {e}"
-                            ))
-                        })?;
-                        occupied_entry.insert(Arc::downgrade(&reader));
-                        reader
-                    }
-                }
-                Entry::Vacant(vacant_entry) => {
-                    tracing::trace!("creating layout reader for {}", vacant_entry.key());
-                    let reader = vxf.layout_reader().map_err(|e| {
-                        DataFusionError::Execution(format!("Failed to create layout reader: {e}"))
-                    })?;
-                    vacant_entry.insert(Arc::downgrade(&reader));
-
-                    reader
-                }
-            };
 
             let mut scan_builder = ScanBuilder::new(session.clone(), Arc::clone(&layout_reader));
 
@@ -393,7 +409,11 @@ impl FileOpener for VortexOpener {
                 })
                 .transpose()?;
             let filter = filter
-                .map(|filter| filter.optimize_recursive(vxf.dtype())?.bind(vxf.dtype()))
+                .map(|filter| {
+                    filter
+                        .optimize_recursive(layout_reader.dtype())?
+                        .bind(layout_reader.dtype())
+                })
                 .transpose()
                 .map_err(|e| exec_datafusion_err!("Couldn't bind Vortex scan filter: {e}"))?;
 
@@ -449,13 +469,18 @@ impl FileOpener for VortexOpener {
                 .with_metrics_registry(metrics_registry)
                 .with_ordered(has_output_ordering)
                 .map(move |chunk| {
+                    let chunk_dtype = chunk.dtype().clone();
                     let mut ctx = session.create_execution_ctx();
                     let arrow_session = ctx.session().clone();
-                    let arrow = arrow_session.arrow().execute_arrow(
-                        chunk,
-                        Some(&stream_target_field),
-                        &mut ctx,
-                    )?;
+                    let arrow = arrow_session
+                        .arrow()
+                        .execute_arrow(chunk, Some(&stream_target_field), &mut ctx)
+                        .map_err(|error| {
+                            error.with_context(format!(
+                                "Failed to convert scan dtype {chunk_dtype} to Arrow target {}",
+                                stream_target_field.data_type()
+                            ))
+                        })?;
                     Ok(RecordBatch::from(arrow.as_struct().clone()))
                 })
                 .into_stream()
@@ -868,6 +893,7 @@ mod tests {
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
+            layout_reader_resolver: None,
             projection_pushdown: false,
             scan_concurrency: None,
         }
@@ -1199,6 +1225,7 @@ mod tests {
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
+            layout_reader_resolver: None,
             projection_pushdown: false,
             scan_concurrency: None,
         };
@@ -1286,6 +1313,7 @@ mod tests {
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
+            layout_reader_resolver: None,
             projection_pushdown: false,
             scan_concurrency: None,
         };
@@ -1443,6 +1471,7 @@ mod tests {
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
+            layout_reader_resolver: None,
             projection_pushdown: false,
             scan_concurrency: None,
         };
@@ -1503,6 +1532,7 @@ mod tests {
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
+            layout_reader_resolver: None,
             projection_pushdown: false,
             scan_concurrency: None,
         }
@@ -1710,6 +1740,7 @@ mod tests {
             has_output_ordering: false,
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             file_metadata_cache: None,
+            layout_reader_resolver: None,
             projection_pushdown: false,
             scan_concurrency: None,
         };
