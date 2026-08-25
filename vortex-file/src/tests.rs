@@ -2337,15 +2337,13 @@ fn layout_has_dict(layout: &dyn DynLayout) -> bool {
             .any(|child| layout_has_dict(child.as_ref()))
 }
 
-/// Mirrors the (private) `IDEAL_SPLIT_SIZE` that `SplitBy::Layout` uses to sub-divide wide
-/// chunk-boundary spans: layout splits are never wider than this many rows.
-const MAX_SPLIT_ROWS: u64 = 100_000;
+const COARSE_SPLIT_ROWS: u64 = 100_000;
 
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
-async fn test_large_flat_chunk_scan_subdivides_splits() -> VortexResult<()> {
-    // A single flat (unchunked) 250k-row layout spans the 100k sub-split threshold, so the scan
-    // must decode it as multiple row-range splits.
+async fn test_large_flat_chunk_scan() -> VortexResult<()> {
+    // Layout splits now preserve physical chunk boundaries. Task-level callers can independently
+    // subdivide this single flat chunk when they need finer-grained parallelism.
     let mut ctx = SESSION.create_execution_ctx();
     const N_ROWS: u64 = 250_000;
     let values =
@@ -2360,19 +2358,14 @@ async fn test_large_flat_chunk_scan_subdivides_splits() -> VortexResult<()> {
 
     let file = SESSION.open_options().open_buffer(buf)?;
 
-    // Sub-division caps each split at MAX_SPLIT_ROWS while tiling the file exactly.
     let splits = file.splits()?;
-    assert!(splits.len() > 1, "expected sub-divided splits: {splits:?}");
-    assert!(splits.iter().all(|r| r.end - r.start <= MAX_SPLIT_ROWS));
-    assert_eq!(splits.first().map(|r| r.start), Some(0));
-    assert_eq!(splits.last().map(|r| r.end), Some(N_ROWS));
-    assert!(splits.windows(2).all(|w| w[0].end == w[1].start));
+    assert_eq!(splits, [0..N_ROWS]);
 
-    // A full scan across the sub-splits returns the original rows.
+    // A full scan still returns the original rows.
     let result = file.scan()?.into_array_stream()?.read_all().await?;
     assert_arrays_eq!(result, values, &mut ctx);
 
-    // A filtered scan crossing sub-split boundaries selects exactly the matching rows.
+    // A filtered scan selects exactly the matching rows.
     let result = file
         .scan()?
         .with_filter(bind_scan_expr(&file, gt(root(), lit(0i32))))
@@ -2462,7 +2455,9 @@ async fn test_string_chunks_stay_fine_grained_under_split_cap() -> VortexResult<
         "expected multiple natural chunks: {splits:?}"
     );
     assert!(
-        splits.iter().all(|r| r.end - r.start < MAX_SPLIT_ROWS / 4),
+        splits
+            .iter()
+            .all(|r| r.end - r.start < COARSE_SPLIT_ROWS / 4),
         "string chunks should stay fine-grained, nowhere near the split cap: {splits:?}"
     );
     assert_eq!(splits.first().map(|r| r.start), Some(0));
