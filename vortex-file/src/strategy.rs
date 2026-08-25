@@ -27,7 +27,6 @@ use vortex_array::arrays::Primitive;
 use vortex_array::arrays::Struct;
 use vortex_array::arrays::VarBin;
 use vortex_array::arrays::VarBinView;
-use vortex_array::arrays::Variant;
 use vortex_array::arrays::patched::use_experimental_patches;
 use vortex_array::dtype::FieldPath;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
@@ -53,8 +52,8 @@ use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::repartition::RepartitionStrategy;
 use vortex_layout::layouts::repartition::RepartitionWriterOptions;
 use vortex_layout::layouts::table::TableStrategy;
-use vortex_layout::layouts::zoned::writer::ZonedLayoutOptions;
-use vortex_layout::layouts::zoned::writer::ZonedStrategy;
+use vortex_layout::layouts::zoned::legacy_writer::LegacyStatsLayoutOptions;
+use vortex_layout::layouts::zoned::legacy_writer::LegacyStatsStrategy;
 #[cfg(feature = "unstable_encodings")]
 use vortex_onpair::OnPair;
 use vortex_pco::Pco;
@@ -94,7 +93,11 @@ pub static ALLOWED_ENCODINGS: LazyLock<HashSet<ArrayId>> = LazyLock::new(|| {
     allowed.insert(Constant.id());
     allowed.insert(Masked.id());
     allowed.insert(Dict.id());
-    allowed.insert(Variant.id());
+
+    // Keep Variant registered with the session for reading release-11 files, but exclude it from
+    // writes for release-10 rollback compatibility. The file writer pre-populates the footer with
+    // every allowed encoding, and release-10 readers reject the unknown `vortex.variant` ID even
+    // when no Variant array is present in the file.
 
     // Compressed encodings from encoding crates
     allowed.insert(ALP.id());
@@ -295,11 +298,15 @@ impl WriteStrategyBuilder {
         );
 
         // 2. calculate stats for each row group
-        let stats = ZonedStrategy::new(
+        let block_size = NonZeroUsize::new(self.row_block_size).vortex_expect("must be non 0");
+        // Keep writing the legacy `vortex.stats` layout so files produced by release-11 remain
+        // readable after a rollback to release-10. The newer aggregate-descriptor-based
+        // `vortex.zoned` layout is intentionally neither written nor registered for reading.
+        let stats = LegacyStatsStrategy::new(
             dict,
             compress_then_flat.clone(),
-            ZonedLayoutOptions {
-                block_size: NonZeroUsize::new(self.row_block_size).vortex_expect("must be non 0"),
+            LegacyStatsLayoutOptions {
+                block_size,
                 ..Default::default()
             },
         );
@@ -325,5 +332,17 @@ impl WriteStrategyBuilder {
             .with_field_writers(self.field_writers);
 
         Arc::new(table_strategy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_array::VTable as _;
+    use vortex_array::arrays::Variant;
+
+    use super::ALLOWED_ENCODINGS;
+    #[test]
+    fn variant_is_excluded_for_release_10_rollback_compatibility() {
+        assert!(!ALLOWED_ENCODINGS.contains(&Variant.id()));
     }
 }

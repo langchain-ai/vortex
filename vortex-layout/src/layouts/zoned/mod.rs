@@ -12,6 +12,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod builder;
+pub mod legacy_writer;
 mod pruning;
 mod reader;
 mod schema;
@@ -305,6 +306,30 @@ pub struct ZonedLayout {
 pub struct LegacyStatsLayout(ZonedLayout);
 
 impl LegacyStatsLayout {
+    /// Create a release-10-compatible zoned layout using legacy `Stat` metadata and table fields.
+    pub fn try_new(
+        data: LayoutRef,
+        zones: LayoutRef,
+        zone_len: NonZeroUsize,
+        present_stats: Arc<[Stat]>,
+    ) -> VortexResult<Self> {
+        vortex_ensure!(present_stats.is_sorted(), "Stats must be sorted");
+        let expected_dtype = legacy_stats_table_dtype(data.dtype(), &present_stats);
+        if zones.dtype() != &expected_dtype {
+            vortex_bail!(
+                "Invalid legacy zone map layout: zones dtype does not match expected dtype"
+            );
+        }
+
+        Ok(Self(ZonedLayout {
+            dtype: data.dtype().clone(),
+            children: OwnedLayoutChildren::layout_children(vec![data, zones]),
+            zone_len: zone_len.get(),
+            zone_map_schema: ZoneMapSchema::LegacyStats(present_stats),
+            stats_table_dtype: expected_dtype,
+        }))
+    }
+
     /// Returns display names for the zone-map aggregates stored by this layout.
     pub fn present_aggregates(&self) -> Arc<[String]> {
         self.0.present_aggregates()

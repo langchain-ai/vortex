@@ -47,6 +47,7 @@ use vortex_array::expr::lt_eq;
 use vortex_array::expr::or;
 use vortex_array::expr::root;
 use vortex_array::expr::select;
+use vortex_array::expr::stats::Stat;
 use vortex_array::extension::datetime::TimeUnit;
 use vortex_array::extension::datetime::Timestamp;
 use vortex_array::extension::datetime::TimestampOptions;
@@ -55,6 +56,7 @@ use vortex_array::scalar_fn::ScalarFnVTableExt;
 use vortex_array::scalar_fn::fns::pack::Pack;
 use vortex_array::scalar_fn::fns::pack::PackOptions;
 use vortex_array::stats::PRUNING_STATS;
+use vortex_array::stats::stats_from_bitset_bytes;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_array::validity::Validity;
@@ -62,6 +64,7 @@ use vortex_buffer::Buffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::Layout;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
@@ -77,6 +80,7 @@ use crate::V1_FOOTER_FBS_SIZE;
 use crate::VERSION;
 use crate::VortexFile;
 use crate::WriteOptionsSessionExt;
+use crate::WriteStrategyBuilder;
 use crate::footer::SegmentSpec;
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = array_session()
@@ -137,6 +141,69 @@ async fn test_read_simple() {
     }
 
     assert_eq!(row_count, 8);
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_write_legacy_stats_layout() -> VortexResult<()> {
+    let array = buffer![1i32, 2, 3, 4].into_array();
+    let strategy = WriteStrategyBuilder::default().build();
+
+    let mut buf = ByteBufferMut::empty();
+    let summary = SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut buf, array.to_array_stream())
+        .await?;
+
+    let layouts = summary
+        .footer()
+        .layout()
+        .depth_first_traversal()
+        .collect::<VortexResult<Vec<_>>>()?;
+    assert!(layouts.iter().any(|layout| layout.is::<LegacyStats>()));
+    assert!(layouts.iter().all(|layout| !layout.is::<Zoned>()));
+
+    let legacy = layouts
+        .iter()
+        .find(|layout| layout.is::<LegacyStats>())
+        .ok_or_else(|| vortex_err!("legacy stats layout must be present"))?;
+    assert_eq!(legacy.encoding_id().as_ref(), "vortex.stats");
+    let metadata = legacy.metadata();
+    assert_eq!(
+        u32::from_le_bytes([metadata[0], metadata[1], metadata[2], metadata[3]]),
+        8192
+    );
+    assert_eq!(
+        stats_from_bitset_bytes(&metadata[4..]),
+        vec![Stat::Max, Stat::Min, Stat::Sum, Stat::NullCount]
+    );
+    assert_eq!(
+        legacy.child(1)?.dtype().as_struct_fields().names().as_ref(),
+        &[
+            Stat::Max.name(),
+            "max_is_truncated",
+            Stat::Min.name(),
+            "min_is_truncated",
+            Stat::Sum.name(),
+            Stat::NullCount.name(),
+        ]
+    );
+
+    let stream = SESSION
+        .open_options()
+        .open_buffer(buf)?
+        .scan()?
+        .into_array_stream()?;
+    pin_mut!(stream);
+
+    let mut row_count = 0;
+    while let Some(array) = stream.next().await {
+        row_count += array?.len();
+    }
+    assert_eq!(row_count, 4);
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -1743,7 +1810,7 @@ async fn timestamp_unit_mismatch_errors_with_constant_children()
         .into_array();
     let temporal = TemporalArray::new_timestamp(ts_array, TimeUnit::Milliseconds, None);
 
-    let strategy = crate::strategy::WriteStrategyBuilder::default()
+    let strategy = WriteStrategyBuilder::default()
         .with_compressor(compressor)
         .build();
 

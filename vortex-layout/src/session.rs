@@ -14,7 +14,6 @@ use crate::layouts::dict::DictLayoutEncoding;
 use crate::layouts::flat::FlatLayoutEncoding;
 use crate::layouts::struct_::StructLayoutEncoding;
 use crate::layouts::zoned::LegacyStatsLayoutEncoding;
-use crate::layouts::zoned::ZonedLayoutEncoding;
 
 pub type LayoutRegistry = Registry<LayoutEncodingRef>;
 
@@ -51,7 +50,6 @@ impl Default for LayoutSession {
         layouts.register(ChunkedLayoutEncoding.id(), ChunkedLayoutEncoding.as_ref());
         layouts.register(FlatLayoutEncoding.id(), FlatLayoutEncoding.as_ref());
         layouts.register(StructLayoutEncoding.id(), StructLayoutEncoding.as_ref());
-        layouts.register(ZonedLayoutEncoding.id(), ZonedLayoutEncoding.as_ref());
         layouts.register(
             LegacyStatsLayoutEncoding.id(),
             LegacyStatsLayoutEncoding.as_ref(),
@@ -79,3 +77,23 @@ pub trait LayoutSessionExt: SessionExt {
     }
 }
 impl<S: SessionExt> LayoutSessionExt for S {}
+
+#[cfg(test)]
+mod tests {
+    use super::LayoutSession;
+    use crate::layouts::zoned::LegacyStatsLayoutEncoding;
+    use crate::layouts::zoned::ZonedLayoutEncoding;
+
+    #[test]
+    fn default_session_only_registers_legacy_zoned_layout() {
+        let layouts = LayoutSession::default();
+
+        assert!(
+            layouts
+                .registry()
+                .find(&LegacyStatsLayoutEncoding.id())
+                .is_some()
+        );
+        assert!(layouts.registry().find(&ZonedLayoutEncoding.id()).is_none());
+    }
+}
