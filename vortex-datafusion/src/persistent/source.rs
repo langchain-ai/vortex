@@ -47,6 +47,7 @@ use crate::convert::exprs::DefaultExpressionConverter;
 use crate::convert::exprs::ExpressionConverter;
 use crate::persistent::reader::DefaultVortexReaderFactory;
 use crate::persistent::reader::VortexReaderFactory;
+use crate::persistent::resolver::LayoutReaderResolver;
 
 /// File scan implementation for reading one or more `.vortex` files.
 ///
@@ -212,6 +213,7 @@ pub struct VortexSource {
     pub(crate) ordered: bool,
     vx_metrics_registry: Arc<dyn MetricsRegistry>,
     file_metadata_cache: Option<Arc<FileMetadataCache>>,
+    layout_reader_resolver: Option<Arc<dyn LayoutReaderResolver>>,
     /// Options controlling scan planning and execution behavior.
     options: VortexTableOptions,
 }
@@ -246,6 +248,7 @@ impl VortexSource {
             vortex_reader_factory: None,
             vx_metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             file_metadata_cache: None,
+            layout_reader_resolver: None,
             ordered: false,
             options: VortexTableOptions::default(),
         }
@@ -312,6 +315,12 @@ impl VortexSource {
         self
     }
 
+    /// Sets the resolver used to construct layout readers for individual files.
+    pub fn with_layout_reader_resolver(mut self, resolver: Arc<dyn LayoutReaderResolver>) -> Self {
+        self.layout_reader_resolver = Some(resolver);
+        self
+    }
+
     /// Sets the per-file Vortex scan concurrency.
     ///
     /// This is separate from DataFusion's partition-level parallelism.
@@ -371,6 +380,7 @@ impl VortexSource {
             has_output_ordering: !base_config.output_ordering.is_empty() || self.ordered,
             expression_converter: Arc::clone(&self.expression_converter),
             file_metadata_cache: self.file_metadata_cache.clone(),
+            layout_reader_resolver: self.layout_reader_resolver.clone(),
             projection_pushdown: self.options.projection_pushdown,
             scan_concurrency: self.options.scan_concurrency,
             scan_v2: self.options.scan_v2,

@@ -28,6 +28,7 @@ mod format;
 pub mod metrics;
 mod opener;
 pub mod reader;
+pub mod resolver;
 mod sink;
 mod source;
 mod stream;
@@ -36,6 +37,8 @@ pub use access_plan::VortexAccessPlan;
 pub use format::VortexFormat;
 pub use format::VortexFormatFactory;
 pub use format::VortexTableOptions;
+pub use resolver::LayoutReaderRef;
+pub use resolver::LayoutReaderResolver;
 pub use sink::VortexSink;
 pub use source::VortexSource;
 
