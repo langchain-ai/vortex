@@ -15,19 +15,20 @@
 //! array session:
 //!
 //! ```rust
-//! use vortex_array::session::ArraySessionExt;
-//!
 //! let session = vortex_array::array_session();
-//! session.arrays().register(vortex_zstd::Zstd);
+//! vortex_zstd::initialize(&session);
 //! ```
 
 pub use array::*;
 use vortex_array::dtype::proto::dtype as pb;
+use vortex_array::session::ArraySessionExt;
+use vortex_session::VortexSession;
 #[cfg(feature = "unstable_encodings")]
 pub use zstd_buffers::*;
 
 mod array;
 mod compute;
+mod kernel;
 mod rules;
 mod slice;
 #[cfg(feature = "unstable_encodings")]
@@ -35,6 +36,12 @@ mod zstd_buffers;
 
 #[cfg(test)]
 mod test;
+
+/// Initialize the Zstd encoding and its compute kernels in the given session.
+pub fn initialize(session: &VortexSession) {
+    session.arrays().register(Zstd);
+    kernel::initialize(session);
+}
 
 #[derive(Clone, prost::Message)]
 /// Metadata for one zstd frame.
