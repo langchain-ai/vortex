@@ -31,6 +31,7 @@ vortex-buffer = { workspace = true }
 vortex-error = { workspace = true }
 vortex-mask = { workspace = true }
 vortex-session = { workspace = true }
+vortex-utils = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
@@ -40,4 +41,8 @@ vortex-array = { workspace = true, features = ["_test-harness"] }
 
 [[bench]]
 name = "listview_rebuild"
+harness = false
+
+[[bench]]
+name = "list_contains"
 harness = false
