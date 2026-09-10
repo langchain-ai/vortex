@@ -1,0 +1,40 @@
+encodings/zstd/src/compute/mod.rs
+  s_f53e844864f91a::t_b7b160462600f6 5
+encodings/zstd/Cargo.toml
+  s_f53e844864f91a::t_b7b160462600f6 34
+  s_f53e844864f91a::t_5f89377cb9108d 45-48
+vortex-file/src/lib.rs
+  s_f53e844864f91a::t_fe1d9fd93764e2 201-204,207-208,218-226,232-240
+  s_f53e844864f91a::t_b7b160462600f6 188-189
+encodings/zstd/src/kernel.rs
+  s_f53e844864f91a::t_b7b160462600f6 1-18
+encodings/zstd/src/lib.rs
+  s_f53e844864f91a::t_b7b160462600f6 19,24-25,31,40-43
+  s_f53e844864f91a::t_816192fff4bd4e 44-45
+encodings/zstd/benches/list_contains.rs
+  s_f53e844864f91a::t_5f89377cb9108d 1-27,33-44,48-67,69,71-117,147-152
+  s_f53e844864f91a::t_b7b160462600f6 28-32,68,70
+  s_f53e844864f91a::t_260ad59e6425c4 45-47,119-127
+  s_f53e844864f91a::t_b99a451db207e5 118,128-146
+encodings/zstd/src/compute/list_contains.rs
+  s_f53e844864f91a::t_49215e07e6cb65 79-81
+  s_f53e844864f91a::t_b7b160462600f6 1-78,82-158
+Cargo.lock
+  s_f53e844864f91a::t_db14243b622c41 10854
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3c0c4483e1ef6020d0dc7bd2dd625f76e65a2288",
+  "prompts": {},
+  "sessions": {
+    "s_f53e844864f91a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a08bea-b869-7c91-a253-d73aea7754f7",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Anirvin Vaddiyar <anirvinv@gmail.com>"
+    }
+  }
+}
