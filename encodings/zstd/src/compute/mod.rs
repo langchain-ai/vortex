@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 mod cast;
+mod list_contains;
 
 #[cfg(test)]
 mod tests {
