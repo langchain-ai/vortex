@@ -8,6 +8,7 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_session;
 use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::ChunkedArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::assert_arrays_eq;
@@ -62,6 +63,27 @@ fn test_zstd_compress_decompress() {
         PrimitiveArray::from_iter(Vec::<i32>::new()),
         &mut ctx
     );
+}
+
+#[test]
+fn test_zstd_primitive_chunks_canonicalize() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let chunks = [0..100_i32, 100..200_i32]
+        .into_iter()
+        .map(|values| {
+            Zstd::from_primitive(&PrimitiveArray::from_iter(values), 3, 30, &mut ctx)
+                .map(IntoArray::into_array)
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+    let chunked = ChunkedArray::try_new(
+        chunks,
+        DType::Primitive(PType::I32, Nullability::NonNullable),
+    )?
+    .into_array();
+
+    let canonical = chunked.execute::<PrimitiveArray>(&mut ctx)?;
+    assert_arrays_eq!(canonical, PrimitiveArray::from_iter(0..200_i32), &mut ctx);
+    Ok(())
 }
 
 #[test]
