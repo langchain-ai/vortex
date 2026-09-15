@@ -289,10 +289,18 @@ impl VTable for Zstd {
         {
             return result;
         }
-        // The two arms here are every builder a `Utf8`/`Binary` dtype has: all four
+        if matches!(array.dtype(), DType::Primitive(..)) {
+            return array
+                .array()
+                .clone()
+                .execute::<Canonical>(ctx)?
+                .into_array()
+                .append_to_builder(builder, ctx);
+        }
+        // The variable-binary branches are every builder a `Utf8`/`Binary` dtype has: all four
         // `VarBinBuilder` widths above, and `VarBinViewBuilder` below. There is deliberately no
-        // canonicalize-then-append fallback — it would decompress to a `VarBinView` only for
-        // `VarBinView::append_to_builder` to reject the same remainder.
+        // canonicalize-then-append fallback for these dtypes — it would decompress to a
+        // `VarBinView` only for `VarBinView::append_to_builder` to reject the same remainder.
         let Some(builder) = builder.as_any_mut().downcast_mut::<VarBinViewBuilder>() else {
             vortex_bail!("append_to_builder for Zstd requires a variable-binary builder")
         };
