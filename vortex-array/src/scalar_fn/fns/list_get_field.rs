@@ -6,18 +6,16 @@ use std::sync::Arc;
 
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
-use vortex_error::VortexExpect;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::arrays::List;
-use crate::arrays::ListArray;
+use crate::arrays::ListViewArray;
 use crate::arrays::StructArray;
-use crate::arrays::list::ListArrayExt;
-use crate::arrays::list::ListArraySlotsExt;
+use crate::arrays::listview::ListViewArrayExt;
+use crate::arrays::listview::ListViewArraySlotsExt;
 use crate::arrays::struct_::StructArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
@@ -25,7 +23,6 @@ use crate::dtype::FieldName;
 use crate::dtype::Nullability;
 use crate::expr::Expression;
 use crate::expr::display::ExprDisplay;
-use crate::matcher::Matcher;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
@@ -106,17 +103,23 @@ impl ScalarFnVTable for ListGetField {
         args: &dyn ExecutionArgs,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let input = args.get(0)?.execute_until::<ListOnly>(ctx)?;
-        let input = input
-            .as_opt::<List>()
-            .vortex_expect("ListOnly matcher returned a non-list array");
-        let elements = input.elements().clone().execute::<StructArray>(ctx)?;
+        let list = args.get(0)?.execute::<ListViewArray>(ctx)?;
+        if list.elements().dtype().as_struct_fields_opt().is_none() {
+            return Ok(list.into_array());
+        }
+        let elements = list.elements().clone().execute::<StructArray>(ctx)?;
         let field = elements.unmasked_field_by_name(field_name).cloned()?;
         let field = match elements.dtype().nullability() {
             Nullability::NonNullable => field,
             Nullability::Nullable => field.mask(elements.validity()?.to_array(elements.len()))?,
         };
-        Ok(ListArray::try_new(field, input.offsets().clone(), input.list_validity())?.into_array())
+        Ok(ListViewArray::new(
+            field,
+            list.offsets().clone(),
+            list.sizes().clone(),
+            list.listview_validity(),
+        )
+        .into_array())
     }
 
     fn validity(
@@ -136,21 +139,12 @@ impl ScalarFnVTable for ListGetField {
     }
 }
 
-struct ListOnly;
-
-impl Matcher for ListOnly {
-    type Match<'a> = ();
-
-    fn try_match(array: &ArrayRef) -> Option<Self::Match<'_>> {
-        array.as_opt::<List>().map(|_| ())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use vortex_buffer::buffer;
 
     use super::*;
+    use crate::arrays::ListArray;
     use crate::arrays::StructArray;
     use crate::assert_arrays_eq;
     use crate::expr::list_get_field;
