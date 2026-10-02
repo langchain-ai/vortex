@@ -1186,8 +1186,8 @@ mod tests {
     async fn projection_multiple_list_element_fields() -> VortexResult<()> {
         let list = create_struct_list_array(true);
         let expected = StructArray::from_fields(&[
-            ("selected", expected_selected_list(true)),
-            ("ignored", expected_ignored_list(true)),
+            ("selected_alias", expected_selected_list(true)),
+            ("ignored_alias", expected_ignored_list(true)),
         ])?
         .into_array();
         let ctx = LayoutReaderContext::new();
@@ -1195,8 +1195,8 @@ mod tests {
         let reader = layout.new_reader("".into(), segments, &session, &ctx)?;
         let expression = pack(
             [
-                ("selected", list_get_field("selected", root())),
-                ("ignored", list_get_field("ignored", root())),
+                ("selected_alias", list_get_field("selected", root())),
+                ("ignored_alias", list_get_field("ignored", root())),
             ],
             Nullability::NonNullable,
         )
