@@ -22,6 +22,7 @@ use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::get_item;
+use vortex_array::expr::pack;
 use vortex_array::expr::root;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::validity::Validity;
@@ -191,6 +192,61 @@ impl ListReader {
                     .project_element_field_bounded(&row_range, &field_name, mask)?
                     .await
             }
+        }
+        .boxed())
+    }
+
+    /// Projects several struct fields from every list element without reading other fields.
+    fn project_element_fields(
+        &self,
+        row_range: &Range<u64>,
+        field_names: &[FieldName],
+        expr: &BoundExpression,
+        mask: MaskFuture,
+    ) -> VortexResult<ArrayFuture> {
+        let is_full_range = row_range.start == 0 && row_range.end == self.layout.row_count();
+        let reader = self.clone();
+        let row_range = row_range.clone();
+        let field_names = field_names.to_vec();
+        let expr = expr.clone();
+        Ok(async move {
+            let mask = mask.await?;
+            let selected_rows = if is_full_range && mask.all_true() {
+                0..usize::try_from(reader.layout.row_count())?
+            } else if let Some(selected_rows) = selected_row_range(&mask) {
+                selected_rows
+            } else {
+                return Ok(Canonical::empty(expr.dtype()).into_array());
+            };
+            let selected_mask = mask.slice(selected_rows.clone());
+            let selected_row_range = (row_range.start + u64::try_from(selected_rows.start)?)
+                ..(row_range.start + u64::try_from(selected_rows.end)?);
+            let offsets = reader.fetch_raw_offsets(&selected_row_range)?.await?;
+            let elements_range = elements_range_from_offsets(&offsets, &reader.session)?;
+            let elements = reader
+                .fetch_element_fields(&elements_range, &field_names)?
+                .await?;
+            let validity = fetch_validity(
+                reader.validity.as_ref(),
+                &selected_row_range,
+                MaskFuture::new_true(selected_mask.len()),
+            )?
+            .await?;
+            let offsets = rebase_offsets(offsets, elements_range.start)?;
+            let list = unsafe {
+                ListArray::new_unchecked(
+                    elements,
+                    offsets,
+                    create_validity(validity, reader.layout.dtype().nullability()),
+                )
+            }
+            .into_array();
+            let list = if selected_mask.all_true() {
+                list
+            } else {
+                list.filter(selected_mask)?
+            };
+            list.apply_bound(&expr)
         }
         .boxed())
     }
@@ -434,6 +490,24 @@ impl ListReader {
         self.elements
             .projection_evaluation(row_range, &projection, MaskFuture::new_true(row_count))
     }
+
+    fn fetch_element_fields(
+        &self,
+        row_range: &Range<u64>,
+        field_names: &[FieldName],
+    ) -> VortexResult<ArrayFuture> {
+        let row_count = usize::try_from(row_range.end - row_range.start)?;
+        let projection = pack(
+            field_names
+                .iter()
+                .cloned()
+                .map(|name| (name.clone(), get_item(name, root()))),
+            Nullability::NonNullable,
+        )
+        .bind(self.elements.dtype())?;
+        self.elements
+            .projection_evaluation(row_range, &projection, MaskFuture::new_true(row_count))
+    }
 }
 
 fn selected_row_range(mask: &Mask) -> Option<Range<usize>> {
@@ -586,8 +660,14 @@ impl LayoutReader for ListReader {
             ListChildrenNeeded::OffsetsAndValidity => {
                 self.project_offsets_validity(row_range, expr, mask)
             }
-            ListChildrenNeeded::ElementField(field_name) => {
-                self.project_element_field(row_range, &field_name, mask)
+            ListChildrenNeeded::ElementFields(field_names) if field_names.len() == 1 => self
+                .project_element_field(
+                    row_range,
+                    field_names.first().vortex_expect("one element field"),
+                    mask,
+                ),
+            ListChildrenNeeded::ElementFields(field_names) => {
+                self.project_element_fields(row_range, &field_names, expr, mask)
             }
             ListChildrenNeeded::All => self.project_all(row_range, expr, mask),
         }
@@ -742,8 +822,8 @@ mod tests {
     use vortex_array::expr::gt;
     use vortex_array::expr::is_not_null;
     use vortex_array::expr::is_null;
-    use vortex_array::expr::list_length;
     use vortex_array::expr::list_get_field;
+    use vortex_array::expr::list_length;
     use vortex_array::expr::lit;
     use vortex_buffer::buffer;
     use vortex_io::session::RuntimeSession;
@@ -1040,13 +1120,9 @@ mod tests {
         } else {
             Validity::NonNullable
         };
-        ListArray::try_new(
-            elements,
-            buffer![0_u32, 2, 3, 5].into_array(),
-            validity,
-        )
-        .expect("list is valid")
-        .into_array()
+        ListArray::try_new(elements, buffer![0_u32, 2, 3, 5].into_array(), validity)
+            .expect("list is valid")
+            .into_array()
     }
 
     fn expected_selected_list(nullable: bool) -> ArrayRef {
@@ -1057,6 +1133,21 @@ mod tests {
         };
         ListArray::try_new(
             buffer![10_i32, 11, 20, 30, 31].into_array(),
+            buffer![0_u32, 2, 3, 5].into_array(),
+            validity,
+        )
+        .expect("list is valid")
+        .into_array()
+    }
+
+    fn expected_ignored_list(nullable: bool) -> ArrayRef {
+        let validity = if nullable {
+            Validity::Array(BoolArray::from_iter([true, false, true]).into_array())
+        } else {
+            Validity::NonNullable
+        };
+        ListArray::try_new(
+            buffer![100_i64, 110, 200, 300, 310].into_array(),
             buffer![0_u32, 2, 3, 5].into_array(),
             validity,
         )
@@ -1084,6 +1175,34 @@ mod tests {
         let expression = list_get_field("selected", root()).bind(reader.dtype())?;
         let result = reader
             .projection_evaluation(&row_range, &expression, MaskFuture::ready(mask))?
+            .await?;
+
+        let mut exec_ctx = session.create_execution_ctx();
+        assert_arrays_eq!(result, expected, &mut exec_ctx);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projection_multiple_list_element_fields() -> VortexResult<()> {
+        let list = create_struct_list_array(true);
+        let expected = StructArray::from_fields(&[
+            ("selected", expected_selected_list(true)),
+            ("ignored", expected_ignored_list(true)),
+        ])?
+        .into_array();
+        let ctx = LayoutReaderContext::new();
+        let (segments, layout, session) = write_layout(&flat_list_strategy(), list).await?;
+        let reader = layout.new_reader("".into(), segments, &session, &ctx)?;
+        let expression = pack(
+            [
+                ("selected", list_get_field("selected", root())),
+                ("ignored", list_get_field("ignored", root())),
+            ],
+            Nullability::NonNullable,
+        )
+        .bind(reader.dtype())?;
+        let result = reader
+            .projection_evaluation(&(0..3), &expression, MaskFuture::new_true(3))?
             .await?;
 
         let mut exec_ctx = session.create_execution_ctx();
