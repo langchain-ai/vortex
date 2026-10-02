@@ -39,6 +39,7 @@ use crate::scalar_fn::fns::is_null::IsNull;
 use crate::scalar_fn::fns::like::Like;
 use crate::scalar_fn::fns::like::LikeOptions;
 use crate::scalar_fn::fns::list_contains::ListContains;
+use crate::scalar_fn::fns::list_get_field::ListGetField;
 use crate::scalar_fn::fns::list_length::ListLength;
 use crate::scalar_fn::fns::list_sum::ListSum;
 use crate::scalar_fn::fns::literal::Literal;
@@ -1167,6 +1168,11 @@ pub fn bound_ext_storage(input: BoundExpression) -> BoundExpression {
 /// ```
 pub fn list_length(input: Expression) -> Expression {
     ListLength.new_expr(EmptyOptions, [input])
+}
+
+/// Projects `field_name` from every struct element of `input`.
+pub fn list_get_field(field_name: impl Into<FieldName>, input: Expression) -> Expression {
+    ListGetField.new_expr(field_name.into(), [input])
 }
 
 /// Creates a bound expression that computes the number of elements in each list.
