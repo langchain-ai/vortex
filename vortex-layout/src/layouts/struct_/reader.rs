@@ -549,8 +549,10 @@ mod tests {
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
     use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::ListArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::StructArray;
+    use vortex_array::arrays::VarBinArray;
     use vortex_array::arrays::struct_::StructArrayExt;
     use vortex_array::assert_arrays_eq;
     use vortex_array::assert_nth_scalar;
@@ -564,6 +566,7 @@ mod tests {
     use vortex_array::expr::eq;
     use vortex_array::expr::get_item;
     use vortex_array::expr::gt;
+    use vortex_array::expr::list_get_field;
     use vortex_array::expr::lit;
     use vortex_array::expr::or;
     use vortex_array::expr::pack;
@@ -874,6 +877,109 @@ mod tests {
             expected_b,
             &mut ctx
         );
+    }
+
+    #[test]
+    fn test_struct_layout_projects_aliased_list_element_fields() {
+        let ctx = ArrayContext::empty();
+        let segments = Arc::new(TestSegments::default());
+        let elements = StructArray::from_fields(&[
+            (
+                "content_type",
+                VarBinArray::from(vec!["text", "image"]).into_array(),
+            ),
+            ("content_length", buffer![4_u32, 8].into_array()),
+            (
+                "content",
+                VarBinArray::from(vec!["body", "payload"]).into_array(),
+            ),
+        ])
+        .unwrap()
+        .into_array();
+        let content_blocks = ListArray::try_new(
+            elements,
+            buffer![0_u32, 1, 2].into_array(),
+            Validity::NonNullable,
+        )
+        .unwrap()
+        .into_array();
+        let input = StructArray::from_fields(&[
+            ("scope_id", buffer![1_i32, 2].into_array()),
+            ("content_blocks", content_blocks),
+        ])
+        .unwrap()
+        .into_array();
+        let (ptr, eof) = SequenceId::root().split();
+        let strategy = TableStrategy::new(
+            Arc::new(FlatLayoutStrategy::default()),
+            Arc::new(FlatLayoutStrategy::default()),
+        )
+        .with_list_layout();
+        let segments2 = Arc::<TestSegments>::clone(&segments);
+        let layout = block_on(|handle| async move {
+            let session = new_session().with_handle(handle);
+            strategy
+                .write_stream(
+                    ctx.into(),
+                    segments2,
+                    input.to_array_stream().sequenced(ptr),
+                    eof,
+                    &session,
+                )
+                .await
+        })
+        .unwrap();
+        let reader = layout
+            .new_reader("".into(), segments, &SESSION, &Default::default())
+            .unwrap();
+        let content_blocks = get_item("content_blocks", root());
+        let expr = pack(
+            [
+                ("scope_id", get_item("scope_id", root())),
+                (
+                    "content_types",
+                    list_get_field("content_type", content_blocks.clone()),
+                ),
+                (
+                    "content_lengths",
+                    list_get_field("content_length", content_blocks),
+                ),
+            ],
+            Nullability::NonNullable,
+        )
+        .bind(reader.dtype())
+        .unwrap();
+        let result = block_on(|_| {
+            reader
+                .projection_evaluation(&(0..2), &expr, MaskFuture::new_true(2))
+                .unwrap()
+        })
+        .unwrap();
+        let expected = StructArray::from_fields(&[
+            ("scope_id", buffer![1_i32, 2].into_array()),
+            (
+                "content_types",
+                ListArray::try_new(
+                    VarBinArray::from(vec!["text", "image"]).into_array(),
+                    buffer![0_u32, 1, 2].into_array(),
+                    Validity::NonNullable,
+                )
+                .unwrap()
+                .into_array(),
+            ),
+            (
+                "content_lengths",
+                ListArray::try_new(
+                    buffer![4_u32, 8].into_array(),
+                    buffer![0_u32, 1, 2].into_array(),
+                    Validity::NonNullable,
+                )
+                .unwrap()
+                .into_array(),
+            ),
+        ])
+        .unwrap();
+        assert_arrays_eq!(result, expected, &mut SESSION.create_execution_ctx());
     }
 
     #[rstest]

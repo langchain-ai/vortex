@@ -2,11 +2,13 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use vortex_array::dtype::DType;
+use vortex_array::dtype::FieldName;
 use vortex_array::dtype::Nullability;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::bound::not;
 use vortex_array::scalar_fn::fns::is_not_null::IsNotNull;
 use vortex_array::scalar_fn::fns::is_null::IsNull;
+use vortex_array::scalar_fn::fns::list_get_field::ListGetField;
 use vortex_array::scalar_fn::fns::list_length::ListLength;
 use vortex_error::VortexResult;
 
@@ -16,18 +18,24 @@ use vortex_error::VortexResult;
 ///     - `is_null(root())` only needs the validity child.
 ///     - `list_length(root())` only needs the offsets and validity children.
 ///     - `root()` needs elements, offsets, and validity children.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ListChildrenNeeded {
     /// Only the validity child is needed (`is_null` / `is_not_null`).
     Validity,
     /// Only the offsets and validity children are needed (`list_length`).
     OffsetsAndValidity,
+    /// Offsets, validity, and selected fields from every struct element are needed.
+    ElementFields(Vec<FieldName>),
     /// All children are needed.
     All,
 }
 
 /// The minimal set of list children needed to evaluate a bound expression.
 pub(super) fn get_necessary_bound_list_children(expr: &BoundExpression) -> ListChildrenNeeded {
+    if let Some(field_name) = bound_list_get_field_root(expr) {
+        return ListChildrenNeeded::ElementFields(vec![field_name.clone()]);
+    }
+
     if is_bound_null_root(expr) {
         return ListChildrenNeeded::Validity;
     }
@@ -43,8 +51,38 @@ pub(super) fn get_necessary_bound_list_children(expr: &BoundExpression) -> ListC
     expr.children()
         .iter()
         .map(get_necessary_bound_list_children)
-        .max()
+        .reduce(merge_needed_children)
         .unwrap_or(ListChildrenNeeded::Validity)
+}
+
+fn merge_needed_children(
+    left: ListChildrenNeeded,
+    right: ListChildrenNeeded,
+) -> ListChildrenNeeded {
+    match (left, right) {
+        (ListChildrenNeeded::All, _) | (_, ListChildrenNeeded::All) => ListChildrenNeeded::All,
+        (ListChildrenNeeded::ElementFields(mut left), ListChildrenNeeded::ElementFields(right)) => {
+            for field in right {
+                if !left.contains(&field) {
+                    left.push(field);
+                }
+            }
+            ListChildrenNeeded::ElementFields(left)
+        }
+        (fields @ ListChildrenNeeded::ElementFields(_), _)
+        | (_, fields @ ListChildrenNeeded::ElementFields(_)) => fields,
+        (ListChildrenNeeded::OffsetsAndValidity, _)
+        | (_, ListChildrenNeeded::OffsetsAndValidity) => ListChildrenNeeded::OffsetsAndValidity,
+        (ListChildrenNeeded::Validity, ListChildrenNeeded::Validity) => {
+            ListChildrenNeeded::Validity
+        }
+    }
+}
+
+fn bound_list_get_field_root(expr: &BoundExpression) -> Option<&FieldName> {
+    expr.as_scalar()
+        .and_then(|scalar_fn| scalar_fn.as_opt::<ListGetField>())
+        .filter(|_| expr.children().len() == 1 && expr.children()[0].is_root())
 }
 
 fn is_bound_null_root(expr: &BoundExpression) -> bool {
