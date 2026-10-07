@@ -2735,30 +2735,46 @@ async fn large_flat_file() -> VortexResult<(VortexFile, ArrayRef)> {
 #[tokio::test]
 #[cfg_attr(miri, ignore)]
 async fn test_large_flat_chunk_scan_subdivides_splits() -> VortexResult<()> {
-    // A single flat (unchunked) 250k-row layout spans the 100k sub-split threshold, so the scan
-    // must decode it as multiple row-range splits.
+    // A single flat (unchunked) 250k-row layout spans the 100k sub-split threshold, so a
+    // sub-splitting scan must decode it as multiple row-range splits.
+    const SUB_SPLITTING: SplitBy = SplitBy::LayoutSubSplitting {
+        max_rows: DEFAULT_MAX_SPLIT_ROWS,
+    };
     let mut ctx = SESSION.create_execution_ctx();
     let (file, values) = large_flat_file().await?;
 
-    // Sub-division caps each split at DEFAULT_MAX_SPLIT_ROWS while tiling the file exactly.
+    // The default split follows the layout, keeping the chunk whole.
     let splits = file.splits()?;
-    assert!(splits.len() > 1, "expected sub-divided splits: {splits:?}");
+    assert_eq!(splits.len(), 1, "expected a single split: {splits:?}");
+    assert_eq!(splits[0], 0..FLAT_N_ROWS);
+
+    // Sub-division caps each split at DEFAULT_MAX_SPLIT_ROWS while tiling the file exactly.
+    let chunks: Vec<ArrayRef> = file
+        .scan()?
+        .with_split_by(SUB_SPLITTING)
+        .into_array_stream()?
+        .try_collect()
+        .await?;
+    assert!(chunks.len() > 1, "expected sub-divided splits");
     assert!(
-        splits
+        chunks
             .iter()
-            .all(|r| r.end - r.start <= DEFAULT_MAX_SPLIT_ROWS)
+            .all(|c| c.len() as u64 <= DEFAULT_MAX_SPLIT_ROWS)
     );
-    assert_eq!(splits.first().map(|r| r.start), Some(0));
-    assert_eq!(splits.last().map(|r| r.end), Some(FLAT_N_ROWS));
-    assert!(splits.windows(2).all(|w| w[0].end == w[1].start));
 
     // A full scan across the sub-splits returns the original rows.
-    let result = file.scan()?.into_array_stream()?.read_all().await?;
+    let result = file
+        .scan()?
+        .with_split_by(SUB_SPLITTING)
+        .into_array_stream()?
+        .read_all()
+        .await?;
     assert_arrays_eq!(result, values, &mut ctx);
 
     // A filtered scan crossing sub-split boundaries selects exactly the matching rows.
     let result = file
         .scan()?
+        .with_split_by(SUB_SPLITTING)
         .with_filter(bind_scan_expr(&file, gt(root(), lit(0i32))))
         .into_array_stream()?
         .read_all()

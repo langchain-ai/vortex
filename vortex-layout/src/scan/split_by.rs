@@ -27,13 +27,13 @@ pub enum SplitBy {
     /// Splits any time there is a chunk boundary in the file, and nowhere else. This yields
     /// splits that follow the file's chunking exactly, trading intra-file decode parallelism
     /// for fewer, larger batches.
+    ///
+    /// This is the default.
     Layout,
     /// Splits like [`SplitBy::Layout`], except that spans between adjacent chunk boundaries
     /// wider than `max_rows` are further sub-divided into evenly sized splits of at most
     /// `max_rows` rows, so that a file with few, large chunks can still be decoded across
-    /// multiple cores. `max_rows` must be non-zero.
-    ///
-    /// This is the default, with [`DEFAULT_MAX_SPLIT_ROWS`].
+    /// multiple cores. `max_rows` must be non-zero; [`DEFAULT_MAX_SPLIT_ROWS`] is a sensible value.
     LayoutSubSplitting { max_rows: u64 },
     /// Splits every n rows.
     RowCount(usize),
@@ -41,10 +41,11 @@ pub enum SplitBy {
 }
 
 impl Default for SplitBy {
+    /// Follow the layout's chunk boundaries. Callers that want intra-chunk decode parallelism
+    /// opt into [`SplitBy::LayoutSubSplitting`] explicitly, so that scans don't re-decode the
+    /// same chunk once per sub-split.
     fn default() -> Self {
-        SplitBy::LayoutSubSplitting {
-            max_rows: DEFAULT_MAX_SPLIT_ROWS,
-        }
+        SplitBy::Layout
     }
 }
 
