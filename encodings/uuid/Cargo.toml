@@ -28,5 +28,6 @@ vortex-session = { workspace = true }
 [dev-dependencies]
 arrow-array = { workspace = true, features = ["ffi"] }
 arrow-buffer = { workspace = true }
+flatbuffers = { workspace = true }
 rstest = { workspace = true }
 vortex-array = { workspace = true, features = ["_test-harness"] }

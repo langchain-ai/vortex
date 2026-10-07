@@ -307,12 +307,13 @@ impl TryFrom<ViewedDType> for DType {
                 let storage_dtype = DType::try_from(storage_view)
                     .map_err(|e| vortex_err!("failed to create DType from fbs message: {e}"))?;
 
+                // Older files omitted metadata for extensions without any metadata. The current
+                // extension contract represents that state as an empty byte slice, which the
+                // extension's own metadata parser still validates.
                 let metadata = fb_ext
                     .metadata()
-                    .ok_or_else(|| {
-                        vortex_err!("failed to parse extension metadata from flatbuffer")
-                    })?
-                    .bytes();
+                    .map(|metadata| metadata.bytes())
+                    .unwrap_or_default();
                 let ext_dtype = if let Some(vtable) = vfdt.session.dtypes().registry().get(&id) {
                     vtable.deserialize(metadata, storage_dtype)?
                 } else if vfdt.session.allows_unknown() {

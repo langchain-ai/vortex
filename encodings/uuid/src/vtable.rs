@@ -122,6 +122,7 @@ impl ExtVTable for Uuid {
 mod tests {
     use std::sync::Arc;
 
+    use flatbuffers::FlatBufferBuilder;
     use rstest::rstest;
     use uuid::Version;
     use vortex_array::dtype::DType;
@@ -129,9 +130,14 @@ mod tests {
     use vortex_array::dtype::PType;
     use vortex_array::dtype::extension::ExtDType;
     use vortex_array::dtype::extension::ExtVTable;
+    use vortex_array::dtype::flatbuffers as fb;
+    use vortex_array::flatbuffers::FlatBuffer;
+    use vortex_array::flatbuffers::WriteFlatBuffer;
     use vortex_array::scalar::Scalar;
     use vortex_array::scalar::ScalarValue;
+    use vortex_buffer::ByteBuffer;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::Uuid;
     use crate::UuidMetadata;
@@ -313,6 +319,45 @@ mod tests {
 
         let result = Uuid::unpack_native(&ext_dtype, &storage_value)?;
         assert_eq!(result, v4_uuid);
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_flatbuffer_without_metadata_as_default() -> VortexResult<()> {
+        // Older writers omitted the metadata field for UUID extension dtypes instead of writing
+        // an empty one. Footers written that way must still read back as a UUID dtype.
+        let storage_dtype = uuid_storage_dtype(Nullability::NonNullable);
+        let mut fbb = FlatBufferBuilder::new();
+        let id = fbb.create_string(Uuid.id().as_ref());
+        let storage_dtype_offset = storage_dtype.write_flatbuffer(&mut fbb)?;
+        let extension = fb::Extension::create(
+            &mut fbb,
+            &fb::ExtensionArgs {
+                id: Some(id),
+                storage_dtype: Some(storage_dtype_offset),
+                metadata: None,
+            },
+        );
+        let dtype = fb::DType::create(
+            &mut fbb,
+            &fb::DTypeArgs {
+                type_type: fb::Type::Extension,
+                type_: Some(extension.as_union_value()),
+            },
+        );
+        fbb.finish_minimal(dtype);
+        let (bytes, start) = fbb.collapse();
+        let end = bytes.len();
+        let buffer = FlatBuffer::align_from(ByteBuffer::from(bytes).slice(start..end));
+
+        let session = VortexSession::empty();
+        crate::initialize(&session);
+        let actual = DType::from_flatbuffer(buffer, &session)?;
+
+        let expected = DType::Extension(
+            ExtDType::try_with_vtable(Uuid, UuidMetadata::default(), storage_dtype)?.erased(),
+        );
+        assert_eq!(actual, expected);
         Ok(())
     }
 

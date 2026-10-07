@@ -12605,6 +12605,7 @@ dependencies = [
  "arrow-array 59.3.1",
  "arrow-buffer 59.3.1",
  "arrow-schema 59.3.1",
+ "flatbuffers",
  "rstest",
  "uuid",
  "vortex-array",
