@@ -277,10 +277,16 @@ mod default_encoding_tests {
     use vortex_array::VTable as _;
     use vortex_array::arrays::Filter;
     use vortex_array::optimizer::kernels::ArrayKernelsExt as _;
+    #[cfg(feature = "zstd")]
+    use vortex_array::scalar_fn::ScalarFnVTable as _;
+    #[cfg(feature = "zstd")]
+    use vortex_array::scalar_fn::fns::list_contains::ListContains;
     use vortex_array::session::ArraySessionExt as _;
     use vortex_fsst::FSST;
     use vortex_onpair::OnPair;
     use vortex_session::VortexSession;
+    #[cfg(feature = "zstd")]
+    use vortex_zstd::Zstd;
 
     use crate::register_default_encodings;
 
@@ -290,6 +296,15 @@ mod default_encoding_tests {
 
         assert!(!session.arrays().registry().contains_key(&FSST.id()));
         assert!(!session.kernels().has_execute_parent(Filter.id(), FSST.id()));
+        #[cfg(feature = "zstd")]
+        {
+            assert!(!session.arrays().registry().contains_key(&Zstd.id()));
+            assert!(
+                !session
+                    .kernels()
+                    .has_execute_parent(ListContains.id(), Zstd.id())
+            );
+        }
 
         register_default_encodings(&session);
 
@@ -301,5 +316,14 @@ mod default_encoding_tests {
                 .kernels()
                 .has_execute_parent(Filter.id(), OnPair.id())
         );
+        #[cfg(feature = "zstd")]
+        {
+            assert!(session.arrays().registry().contains_key(&Zstd.id()));
+            assert!(
+                session
+                    .kernels()
+                    .has_execute_parent(ListContains.id(), Zstd.id())
+            );
+        }
     }
 }

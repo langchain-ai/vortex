@@ -15,11 +15,10 @@
 //! array session:
 //!
 //! ```rust
-//! use vortex_array::session::ArraySessionExt;
 //! use vortex_session::VortexSession;
 //!
 //! let session = VortexSession::empty();
-//! session.arrays().register(vortex_zstd::Zstd);
+//! vortex_zstd::initialize(&session);
 //! ```
 
 pub use array::*;
@@ -37,6 +36,7 @@ mod array;
 mod compute;
 mod decompressor;
 pub mod editions;
+mod kernel;
 mod rules;
 mod slice;
 mod zstd_buffers;
@@ -48,6 +48,7 @@ mod test;
 pub fn initialize(session: &VortexSession) {
     session.arrays().register(Zstd);
     session.arrays().register(ZstdBuffers);
+    kernel::initialize(session);
     if session.editions().find(&editions::ZSTD_2026_02).is_none() {
         session
             .editions()

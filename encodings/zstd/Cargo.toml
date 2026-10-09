@@ -28,8 +28,15 @@ vortex-edition = { workspace = true }
 vortex-error = { workspace = true }
 vortex-mask = { workspace = true }
 vortex-session = { workspace = true }
+vortex-utils = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+divan = { workspace = true }
+mimalloc = { workspace = true }
 rstest = { workspace = true }
 vortex-array = { workspace = true, features = ["_test-harness"] }
+
+[[bench]]
+name = "list_contains"
+harness = false
