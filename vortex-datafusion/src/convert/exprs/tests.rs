@@ -7,6 +7,7 @@ use arrow_array::Array;
 use arrow_array::DictionaryArray;
 use arrow_array::FixedSizeBinaryArray;
 use arrow_array::Int32Array;
+use arrow_array::ListArray;
 use arrow_array::RecordBatch;
 use arrow_array::RunArray;
 use arrow_array::StringArray;
@@ -35,6 +36,7 @@ use datafusion_common::metadata::FieldMetadata;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_expr::ScalarUDF;
 use datafusion_functions::core::coalesce::CoalesceFunc;
+use datafusion_functions::string::lower::LowerFunc;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr::projection::ProjectionExpr;
@@ -2128,5 +2130,142 @@ fn test_fallible_boolean_rhs_is_residual(
     // DataFusion selects the one row that needs RHS evaluation at this selectivity.
     expr.evaluate(&batch)?;
     assert!(!converts(&expr, &batch.schema())?);
+    Ok(())
+}
+
+fn array_has_expr(
+    list: Arc<dyn PhysicalExpr>,
+    needle: Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> DFResult<Arc<dyn PhysicalExpr>> {
+    Ok(Arc::new(ScalarFunctionExpr::try_new(
+        Arc::new(ScalarUDF::from(ArrayHas::new())),
+        vec![list, needle],
+        schema,
+        Arc::new(ConfigOptions::new()),
+    )?))
+}
+
+#[test]
+fn test_array_has_with_non_null_needle_matches_datafusion() -> anyhow::Result<()> {
+    let lists = ListArray::from_iter_primitive::<Int32Type, _, _>([
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![None, Some(3)]),
+        Some(vec![None]),
+        Some(vec![]),
+        None,
+    ]);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "tags",
+        lists.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(lists)])?;
+    let tags = Arc::new(df_expr::Column::new("tags", 0)) as Arc<dyn PhysicalExpr>;
+
+    for needle in [2, 3, 7] {
+        let needle = Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(needle))));
+        assert_native_matches(
+            array_has_expr(Arc::clone(&tags), needle, &schema)?,
+            batch.clone(),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_array_has_with_nullable_needle_stays_in_datafusion() -> DFResult<()> {
+    // DataFusion yields null for a null needle against an empty list; list_contains yields false.
+    let schema = Schema::new(vec![
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
+        Field::new("needle", DataType::Int32, true),
+    ]);
+    let expr = array_has_expr(
+        Arc::new(df_expr::Column::new("tags", 0)),
+        Arc::new(df_expr::Column::new("needle", 1)),
+        &schema,
+    )?;
+    assert!(!converts(&expr, &schema)?);
+    Ok(())
+}
+
+/// A converter that adds DataFusion's `lower`, converted to its input, to the built-in rules.
+struct LowerConverter(DefaultExpressionConverter);
+
+impl ExpressionConverter for LowerConverter {
+    fn try_convert(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+    ) -> DFResult<Option<Expression>> {
+        if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>()
+            && scalar_fn.name() == "lower"
+        {
+            let [input] = scalar_fn.args() else {
+                return Ok(None);
+            };
+            return self.try_convert(input, schema);
+        }
+        self.0.try_convert_with(self, expr, schema)
+    }
+}
+
+fn lower_expr(input: Arc<dyn PhysicalExpr>, schema: &Schema) -> DFResult<Arc<dyn PhysicalExpr>> {
+    Ok(Arc::new(ScalarFunctionExpr::try_new(
+        Arc::new(ScalarUDF::from(LowerFunc::new())),
+        vec![input],
+        schema,
+        Arc::new(ConfigOptions::new()),
+    )?))
+}
+
+#[rstest]
+fn test_delegate_converts_custom_children_anywhere(test_schema: Schema) -> DFResult<()> {
+    // NOT (lower(name) = 'x') OR id > 1
+    let name = Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>;
+    let equals = Arc::new(df_expr::BinaryExpr::new(
+        lower_expr(name, &test_schema)?,
+        DFOperator::Eq,
+        Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some("x".into())))),
+    )) as Arc<dyn PhysicalExpr>;
+    let id_gt = Arc::new(df_expr::BinaryExpr::new(
+        Arc::new(df_expr::Column::new("id", 0)),
+        DFOperator::Gt,
+        Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(1)))),
+    )) as Arc<dyn PhysicalExpr>;
+    let expr = Arc::new(df_expr::BinaryExpr::new(
+        Arc::new(df_expr::NotExpr::new(equals)),
+        DFOperator::Or,
+        id_gt,
+    )) as Arc<dyn PhysicalExpr>;
+
+    assert!(!converts(&expr, &test_schema)?);
+    let converter = LowerConverter(DefaultExpressionConverter::default());
+    assert!(converter.try_convert(&expr, &test_schema)?.is_some());
+    Ok(())
+}
+
+#[rstest]
+fn test_delegate_declining_a_child_declines_the_expression(test_schema: Schema) -> DFResult<()> {
+    // The delegate cannot convert `coalesce`, so the whole comparison stays in DataFusion.
+    let name = Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>;
+    let coalesced = Arc::new(ScalarFunctionExpr::try_new(
+        Arc::new(ScalarUDF::from(CoalesceFunc::new())),
+        vec![Arc::clone(&name), name],
+        &test_schema,
+        Arc::new(ConfigOptions::new()),
+    )?) as Arc<dyn PhysicalExpr>;
+    let expr = Arc::new(df_expr::BinaryExpr::new(
+        coalesced,
+        DFOperator::Eq,
+        Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some("x".into())))),
+    )) as Arc<dyn PhysicalExpr>;
+
+    let converter = LowerConverter(DefaultExpressionConverter::default());
+    assert!(converter.try_convert(&expr, &test_schema)?.is_none());
     Ok(())
 }

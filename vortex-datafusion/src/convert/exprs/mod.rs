@@ -14,6 +14,7 @@ use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_functions::string::octet_length::OctetLengthFunc;
+use datafusion_functions_nested::array_has::ArrayHas;
 use datafusion_functions_nested::length::ArrayLength;
 use datafusion_physical_expr::DynamicFilterTracking;
 use datafusion_physical_expr::PhysicalExpr;
@@ -33,6 +34,7 @@ use vortex::expr::get_item;
 use vortex::expr::in_list_of;
 use vortex::expr::is_not_null;
 use vortex::expr::is_null;
+use vortex::expr::list_contains;
 use vortex::expr::list_length;
 use vortex::expr::lit;
 use vortex::expr::nested_case_when;
@@ -226,6 +228,57 @@ impl DefaultExpressionConverter {
         Self { session }
     }
 
+    /// Convert `expr` with the built-in rules, converting every child expression through
+    /// `delegate`.
+    ///
+    /// Custom converters use this to support their own expressions (e.g. UDFs) anywhere in an
+    /// expression tree: implement [`ExpressionConverter::try_convert`] by handling the custom
+    /// expressions and passing everything else here with `self` as the delegate. Delegated
+    /// children go through the delegate's `try_convert`, including its type checks.
+    pub fn try_convert_with(
+        &self,
+        delegate: &dyn ExpressionConverter,
+        expr: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+    ) -> DFResult<Option<Expression>> {
+        self.try_convert_inner(Some(delegate), expr, schema)
+    }
+
+    fn try_convert_inner(
+        &self,
+        delegate: Option<&dyn ExpressionConverter>,
+        expr: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+    ) -> DFResult<Option<Expression>> {
+        // We currently do not support pushdown of dynamic expressions in DF.
+        // See issue: https://github.com/vortex-data/vortex/issues/4034
+        if DynamicFilterTracking::classify(expr).contains_dynamic_filter() {
+            return Ok(None);
+        }
+        match self.convert_checked(delegate, expr, schema) {
+            Ok(converted) => Ok(Some(converted)),
+            Err(Unconverted::Unsupported) => Ok(None),
+            Err(Unconverted::Failed(error)) => Err(error),
+        }
+    }
+
+    /// Convert a child expression: through `delegate` when there is one, otherwise with the
+    /// built-in rules.
+    fn convert_child(
+        &self,
+        delegate: Option<&dyn ExpressionConverter>,
+        child: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+        input_dtype: &DType,
+    ) -> Conversion<Expression> {
+        match delegate {
+            Some(delegate) => delegate
+                .try_convert(child, schema)?
+                .ok_or(Unconverted::Unsupported),
+            None => self.convert_expr(None, child, schema, input_dtype),
+        }
+    }
+
     /// Resolve an Arrow field through the session registry; unknown types are unsupported.
     fn arrow_dtype(&self, field: &Field) -> Conversion<DType> {
         self.session
@@ -237,6 +290,7 @@ impl DefaultExpressionConverter {
     /// Convert `expr` and check that it returns the dtype DataFusion expects.
     fn convert_checked(
         &self,
+        delegate: Option<&dyn ExpressionConverter>,
         expr: &Arc<dyn PhysicalExpr>,
         schema: &Schema,
     ) -> Conversion<Expression> {
@@ -272,7 +326,7 @@ impl DefaultExpressionConverter {
                     .map_err(DataFusionError::from)?,
             )
             .map_err(|_| Unconverted::Unsupported)?;
-        let converted = self.convert_expr(expr, schema, &input_dtype)?;
+        let converted = self.convert_expr(delegate, expr, schema, &input_dtype)?;
         let expected_dtype = self.arrow_dtype(expr.return_field(schema)?.as_ref())?;
         if !converted_dtype(&converted, &input_dtype)?.eq_ignore_nullability(&expected_dtype) {
             return Err(Unconverted::Unsupported);
@@ -282,6 +336,7 @@ impl DefaultExpressionConverter {
 
     fn convert_expr(
         &self,
+        delegate: Option<&dyn ExpressionConverter>,
         expr: &Arc<dyn PhysicalExpr>,
         schema: &Schema,
         input_dtype: &DType,
@@ -302,8 +357,8 @@ impl DefaultExpressionConverter {
             } else if !supported_data_types(&left_type) || !supported_data_types(&right_type) {
                 return Err(Unconverted::Unsupported);
             }
-            let left = self.convert_expr(binary_expr.left(), schema, input_dtype)?;
-            let right = self.convert_expr(binary_expr.right(), schema, input_dtype)?;
+            let left = self.convert_child(delegate, binary_expr.left(), schema, input_dtype)?;
+            let right = self.convert_child(delegate, binary_expr.right(), schema, input_dtype)?;
             // DataFusion may evaluate the RHS only on rows selected by the LHS.
             if boolean_operator && !(is_infallible(&left) && is_infallible(&right)) {
                 return Err(Unconverted::Unsupported);
@@ -343,7 +398,7 @@ impl DefaultExpressionConverter {
 
         if let Some(cast_expr) = expr.downcast_ref::<df_expr::CastExpr>() {
             let pushdown = classify_cast(cast_expr, schema)?;
-            let child = self.convert_expr(cast_expr.expr(), schema, input_dtype)?;
+            let child = self.convert_child(delegate, cast_expr.expr(), schema, input_dtype)?;
             // DataFusion casts preserve input nulls even when the target field is declared
             // non-nullable. Match the expression's runtime nullability rather than narrowing
             // to the target field's metadata.
@@ -371,7 +426,8 @@ impl DefaultExpressionConverter {
             if not_expr.arg().data_type(schema)? != DataType::Boolean {
                 return Err(exec_datafusion_err!("NOT requires a Boolean operand: {expr}").into());
             }
-            return Ok(not(self.convert_expr(
+            return Ok(not(self.convert_child(
+                delegate,
                 not_expr.arg(),
                 schema,
                 input_dtype,
@@ -379,12 +435,12 @@ impl DefaultExpressionConverter {
         }
 
         if let Some(is_null_expr) = expr.downcast_ref::<df_expr::IsNullExpr>() {
-            let arg = self.convert_expr(is_null_expr.arg(), schema, input_dtype)?;
+            let arg = self.convert_child(delegate, is_null_expr.arg(), schema, input_dtype)?;
             return Ok(is_null(arg));
         }
 
         if let Some(is_not_null_expr) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
-            let arg = self.convert_expr(is_not_null_expr.arg(), schema, input_dtype)?;
+            let arg = self.convert_child(delegate, is_not_null_expr.arg(), schema, input_dtype)?;
             return Ok(is_not_null(arg));
         }
 
@@ -394,8 +450,8 @@ impl DefaultExpressionConverter {
             {
                 return Err(Unconverted::Unsupported);
             }
-            let child = self.convert_expr(like.expr(), schema, input_dtype)?;
-            let pattern = self.convert_expr(like.pattern(), schema, input_dtype)?;
+            let child = self.convert_child(delegate, like.expr(), schema, input_dtype)?;
+            let pattern = self.convert_child(delegate, like.pattern(), schema, input_dtype)?;
             return Ok(Like.new_expr(
                 LikeOptions {
                     negated: like.negated(),
@@ -406,15 +462,15 @@ impl DefaultExpressionConverter {
         }
 
         if let Some(in_list) = expr.downcast_ref::<df_expr::InListExpr>() {
-            return self.convert_in_list(in_list, schema, input_dtype);
+            return self.convert_in_list(delegate, in_list, schema, input_dtype);
         }
 
         if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>() {
-            return self.convert_scalar_function(scalar_fn, schema, input_dtype);
+            return self.convert_scalar_function(delegate, scalar_fn, schema, input_dtype);
         }
 
         if let Some(case_expr) = expr.downcast_ref::<df_expr::CaseExpr>() {
-            return self.convert_case_expr(case_expr, schema, input_dtype);
+            return self.convert_case_expr(delegate, case_expr, schema, input_dtype);
         }
 
         Err(Unconverted::Unsupported)
@@ -422,6 +478,7 @@ impl DefaultExpressionConverter {
 
     fn convert_in_list(
         &self,
+        delegate: Option<&dyn ExpressionConverter>,
         in_list: &df_expr::InListExpr,
         schema: &Schema,
         input_dtype: &DType,
@@ -435,7 +492,7 @@ impl DefaultExpressionConverter {
         {
             return Err(Unconverted::Unsupported);
         }
-        let value = self.convert_expr(in_list.expr(), schema, input_dtype)?;
+        let value = self.convert_child(delegate, in_list.expr(), schema, input_dtype)?;
         // Boolean rewrites may skip evaluating the input, particularly for all-null lists.
         if !is_infallible(&value) {
             return Err(Unconverted::Unsupported);
@@ -446,7 +503,7 @@ impl DefaultExpressionConverter {
             .list()
             .iter()
             .map(|element| {
-                let element = self.convert_expr(element, schema, input_dtype)?;
+                let element = self.convert_child(delegate, element, schema, input_dtype)?;
                 element
                     .as_opt::<Literal>()
                     .cloned()
@@ -466,10 +523,25 @@ impl DefaultExpressionConverter {
 
     fn convert_scalar_function(
         &self,
+        delegate: Option<&dyn ExpressionConverter>,
         scalar_fn: &ScalarFunctionExpr,
         schema: &Schema,
         input_dtype: &DType,
     ) -> Conversion<Expression> {
+        if ScalarFunctionExpr::try_downcast_func::<ArrayHas>(scalar_fn).is_some() {
+            let [list, needle] = scalar_fn.args() else {
+                return Err(exec_datafusion_err!("array_has requires two arguments").into());
+            };
+            // DataFusion's array_has is null for a null needle even against an empty list,
+            // where list_contains is false. Otherwise their null semantics match: a null list
+            // is null and null elements never match. Only push down needles that cannot be null.
+            if needle.nullable(schema)? {
+                return Err(Unconverted::Unsupported);
+            }
+            let list = self.convert_child(delegate, list, schema, input_dtype)?;
+            let needle = self.convert_child(delegate, needle, schema, input_dtype)?;
+            return Ok(list_contains(list, needle));
+        }
         if ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_some() {
             // DataFusion's GetFieldFunc flattens nested field access into a single call
             // with multiple field name arguments, e.g. `outer.inner.leaf` becomes
@@ -500,7 +572,7 @@ impl DefaultExpressionConverter {
                 source_type = field.data_type().clone();
                 names.push(name);
             }
-            let mut result = self.convert_expr(source, schema, input_dtype)?;
+            let mut result = self.convert_child(delegate, source, schema, input_dtype)?;
             for name in names {
                 result = get_item(name, result);
             }
@@ -535,7 +607,7 @@ impl DefaultExpressionConverter {
             } else {
                 return Err(Unconverted::Unsupported);
             };
-        let input = self.convert_expr(input, schema, input_dtype)?;
+        let input = self.convert_child(delegate, input, schema, input_dtype)?;
         let return_dtype = self.arrow_dtype(&Field::new(
             "",
             scalar_fn.return_type().clone(),
@@ -546,6 +618,7 @@ impl DefaultExpressionConverter {
 
     fn convert_case_expr(
         &self,
+        delegate: Option<&dyn ExpressionConverter>,
         case_expr: &df_expr::CaseExpr,
         schema: &Schema,
         input_dtype: &DType,
@@ -559,13 +632,13 @@ impl DefaultExpressionConverter {
             if when_expr.data_type(schema)? != DataType::Boolean {
                 return Err(exec_datafusion_err!("CASE WHEN must be Boolean").into());
             }
-            let condition = self.convert_expr(when_expr, schema, input_dtype)?;
-            let value = self.convert_expr(then_expr, schema, input_dtype)?;
+            let condition = self.convert_child(delegate, when_expr, schema, input_dtype)?;
+            let value = self.convert_child(delegate, then_expr, schema, input_dtype)?;
             pairs.push((condition, value));
         }
         let else_value = case_expr
             .else_expr()
-            .map(|e| self.convert_expr(e, schema, input_dtype))
+            .map(|e| self.convert_child(delegate, e, schema, input_dtype))
             .transpose()?;
         // CASE evaluates conditions on remaining rows and values only on selected rows,
         // so fallible children retain DataFusion's short-circuit behavior.
@@ -579,16 +652,7 @@ impl ExpressionConverter for DefaultExpressionConverter {
         expr: &Arc<dyn PhysicalExpr>,
         schema: &Schema,
     ) -> DFResult<Option<Expression>> {
-        // We currently do not support pushdown of dynamic expressions in DF.
-        // See issue: https://github.com/vortex-data/vortex/issues/4034
-        if DynamicFilterTracking::classify(expr).contains_dynamic_filter() {
-            return Ok(None);
-        }
-        match self.convert_checked(expr, schema) {
-            Ok(converted) => Ok(Some(converted)),
-            Err(Unconverted::Unsupported) => Ok(None),
-            Err(Unconverted::Failed(error)) => Err(error),
-        }
+        self.try_convert_inner(None, expr, schema)
     }
 }
 
