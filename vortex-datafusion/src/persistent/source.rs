@@ -12,10 +12,12 @@ use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_stream::FileOpener;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
+use datafusion_expr::Operator;
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::PhysicalSortExpr;
-use datafusion_physical_expr::conjunction;
+use datafusion_physical_expr::expressions::BinaryExpr;
+use datafusion_physical_expr::expressions::lit;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
@@ -466,12 +468,13 @@ impl FileSource for VortexSource {
 
         // Combine new filters with existing predicate for file pruning.
         // This full predicate is used by FilePruner to eliminate files.
-        source.full_predicate = match source.full_predicate {
-            Some(predicate) => Some(conjunction(
-                std::iter::once(predicate).chain(filters.clone()),
-            )),
-            None => Some(conjunction(filters.clone())),
-        };
+        let full_predicates = source
+            .full_predicate
+            .take()
+            .into_iter()
+            .chain(filters.iter().cloned())
+            .collect::<Vec<_>>();
+        source.full_predicate = Some(conjunction_balanced(&full_predicates));
 
         if !source.options.predicate_pushdown {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(vec![
@@ -513,10 +516,13 @@ impl FileSource for VortexSource {
             })
             .cloned();
 
-        let predicate = match source.vortex_predicate {
-            Some(predicate) => conjunction(std::iter::once(predicate).chain(supported)),
-            None => conjunction(supported),
-        };
+        let predicates = source
+            .vortex_predicate
+            .take()
+            .into_iter()
+            .chain(supported)
+            .collect::<Vec<_>>();
+        let predicate = conjunction_balanced(&predicates);
 
         tracing::debug!(%predicate, "Saving predicate");
 
@@ -546,8 +552,25 @@ impl FileSource for VortexSource {
     }
 }
 
+// Keep recursive planning, pruning, evaluation, and drop depth logarithmic in each filter batch.
+fn conjunction_balanced(predicates: &[PhysicalExprRef]) -> PhysicalExprRef {
+    match predicates {
+        [] => lit(true),
+        [predicate] => Arc::clone(predicate),
+        _ => {
+            let (left, right) = predicates.split_at(predicates.len() / 2);
+            Arc::new(BinaryExpr::new(
+                conjunction_balanced(left),
+                Operator::And,
+                conjunction_balanced(right),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use anyhow::anyhow;
     use arrow_schema::DataType;
     use arrow_schema::Field;
     use arrow_schema::Schema;
@@ -562,6 +585,7 @@ mod tests {
     use datafusion_physical_expr::expressions as df_expr;
     use datafusion_physical_expr::expressions::Column;
     use object_store::memory::InMemory;
+    use rstest::rstest;
     use vortex::VortexSessionDefault;
 
     use super::*;
@@ -632,7 +656,7 @@ mod tests {
         ) as PhysicalExprRef;
         let one = Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(1)))) as PhysicalExprRef;
 
-        Arc::new(df_expr::BinaryExpr::new(octet_length, Operator::Gt, one)) as PhysicalExprRef
+        Arc::new(BinaryExpr::new(octet_length, Operator::Gt, one)) as PhysicalExprRef
     }
 
     fn assert_ordered_source(inner: Arc<dyn FileSource>) -> anyhow::Result<()> {
@@ -692,6 +716,60 @@ mod tests {
             &opener.expression_convertor,
             &expression_convertor
         ));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::single(1)]
+    #[case::odd(3)]
+    #[case::many(4096)]
+    fn try_pushdown_filters_balances_predicates(
+        #[case] count: i32,
+        #[values(false, true)] pushdown: bool,
+    ) -> anyhow::Result<()> {
+        let mut source = sort_test_source(sort_test_schema()).with_predicate_pushdown(pushdown);
+        let mut expected = Vec::with_capacity(count as usize * 2);
+        for _ in 0..2 {
+            let filters = (0..count)
+                .map(|value| {
+                    Arc::new(BinaryExpr::new(
+                        Arc::new(Column::new("a", 0)),
+                        Operator::NotEq,
+                        lit(value),
+                    )) as PhysicalExprRef
+                })
+                .collect::<Vec<_>>();
+            expected.extend(filters.iter().cloned());
+            let result = source.try_pushdown_filters(filters, &ConfigOptions::new())?;
+            assert_eq!(result.filters.len(), count as usize);
+            assert!(result.filters.iter().all(|result| matches!(
+                (result, pushdown),
+                (PushedDown::Yes, true) | (PushedDown::No, false)
+            )));
+            let updated = result
+                .updated_node
+                .ok_or_else(|| anyhow!("expected updated source"))?;
+            source = updated
+                .downcast_ref::<VortexSource>()
+                .ok_or_else(|| anyhow!("expected VortexSource"))?
+                .clone();
+            assert_eq!(source.vortex_predicate.is_some(), pushdown);
+            assert!(source.full_predicate.is_some());
+            for predicate in [&source.full_predicate, &source.vortex_predicate]
+                .into_iter()
+                .flatten()
+            {
+                let mut pending = vec![(predicate, 0)];
+                while let Some((expr, depth)) = pending.pop() {
+                    assert!(depth < 32, "predicate depth was {depth}");
+                    pending.extend(expr.children().into_iter().map(|child| (child, depth + 1)));
+                }
+                assert_eq!(
+                    datafusion_physical_expr::split_conjunction(predicate),
+                    expected.iter().collect::<Vec<_>>()
+                );
+            }
+        }
         Ok(())
     }
 
