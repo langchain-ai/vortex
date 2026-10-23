@@ -602,7 +602,7 @@ impl FileSource for VortexSource {
 }
 
 // Keep recursive planning, pruning, evaluation, and drop depth logarithmic in each filter batch.
-fn conjunction_balanced(predicates: &[PhysicalExprRef]) -> PhysicalExprRef {
+pub(crate) fn conjunction_balanced(predicates: &[PhysicalExprRef]) -> PhysicalExprRef {
     match predicates {
         [] => lit(true),
         [predicate] => Arc::clone(predicate),

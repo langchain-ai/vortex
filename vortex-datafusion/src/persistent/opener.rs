@@ -29,7 +29,6 @@ use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr::split_conjunction;
 use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr::utils::conjunction_opt;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
@@ -77,6 +76,7 @@ use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
 use crate::persistent::reader::VortexReaderFactory;
 use crate::persistent::resolver::LayoutReaderResolver;
+use crate::persistent::source::conjunction_balanced;
 use crate::persistent::stream::PrunableStream;
 
 #[derive(Clone)]
@@ -347,7 +347,8 @@ impl FileOpener for VortexOpener {
                     }
                 }
             }
-            let residual_filter = conjunction_opt(residual_filters);
+            let residual_filter =
+                (!residual_filters.is_empty()).then(|| conjunction_balanced(&residual_filters));
             let native_filter = and_collect(native_filters)
                 .map(|filter| filter.bind(opened.dtype())?.optimize_recursive())
                 .transpose()
@@ -2268,6 +2269,46 @@ mod tests {
         ) -> DFResult<Option<vortex::expr::Expression>> {
             Ok(None)
         }
+    }
+
+    #[tokio::test]
+    async fn test_many_residual_filters() -> anyhow::Result<()> {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let batch = record_batch!(("a", Int32, vec![1, 5_000, 10_000]))?;
+        let size = write_arrow_to_vortex(Arc::clone(&store), "many.vortex", batch.clone()).await?;
+        // `a > 0 AND ... AND a > 4095`, balanced so that only the opener could deepen it.
+        let filters = (0..4096)
+            .map(|bound| {
+                Arc::new(df_expr::BinaryExpr::new(
+                    Arc::new(df_expr::Column::new("a", 0)),
+                    Operator::Gt,
+                    Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(bound)))),
+                )) as PhysicalExprRef
+            })
+            .collect::<Vec<_>>();
+        let mut opener = make_opener(
+            store,
+            TableSchema::from(batch.schema()),
+            Some(conjunction_balanced(&filters)),
+        );
+        opener.expression_converter = Arc::new(ResidualConverter);
+        let batches = opener
+            .open(PartitionedFile::new("many.vortex", size))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_batches_eq!(
+            [
+                "+-------+",
+                "| a     |",
+                "+-------+",
+                "| 5000  |",
+                "| 10000 |",
+                "+-------+"
+            ],
+            &batches
+        );
+        Ok(())
     }
 
     #[rstest]
