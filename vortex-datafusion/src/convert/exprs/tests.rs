@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering as AtomicOrdering;
 
 use arrow_array::Array;
 use arrow_array::DictionaryArray;
@@ -2246,6 +2248,71 @@ fn test_delegate_converts_custom_children_anywhere(test_schema: Schema) -> DFRes
     assert!(!converts(&expr, &test_schema)?);
     let converter = LowerConverter(DefaultExpressionConverter::default());
     assert!(converter.try_convert(&expr, &test_schema)?.is_some());
+    Ok(())
+}
+
+/// A delegate that overrides `convert_subexpression` and counts how it is called.
+struct CountingConverter {
+    inner: DefaultExpressionConverter,
+    whole: AtomicUsize,
+    subexpressions: AtomicUsize,
+}
+
+impl ExpressionConverter for CountingConverter {
+    fn try_convert(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+    ) -> DFResult<Option<Expression>> {
+        self.whole.fetch_add(1, AtomicOrdering::Relaxed);
+        self.inner.try_convert_with(self, expr, schema)
+    }
+
+    fn convert_subexpression(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        scope: &ConversionScope<'_>,
+    ) -> DFResult<Option<ConvertedExpression>> {
+        self.subexpressions.fetch_add(1, AtomicOrdering::Relaxed);
+        self.inner.convert_subexpression_with(self, expr, scope)
+    }
+}
+
+#[rstest]
+fn test_delegate_converts_children_as_subexpressions(test_schema: Schema) -> DFResult<()> {
+    // A balanced OR of 8 `id = i` comparisons: 7 ORs, 8 comparisons and 16 leaves.
+    fn balanced(range: std::ops::Range<i32>) -> Arc<dyn PhysicalExpr> {
+        if range.len() == 1 {
+            return Arc::new(df_expr::BinaryExpr::new(
+                Arc::new(df_expr::Column::new("id", 0)),
+                DFOperator::Eq,
+                Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(range.start)))),
+            ));
+        }
+        let mid = range.start + i32::try_from(range.len() / 2).expect("small range");
+        Arc::new(df_expr::BinaryExpr::new(
+            balanced(range.start..mid),
+            DFOperator::Or,
+            balanced(mid..range.end),
+        ))
+    }
+    let expr = balanced(0..8);
+    let converter = CountingConverter {
+        inner: DefaultExpressionConverter::default(),
+        whole: AtomicUsize::new(0),
+        subexpressions: AtomicUsize::new(0),
+    };
+
+    let converted = converter.try_convert(&expr, &test_schema)?;
+
+    assert_eq!(
+        converted,
+        DefaultExpressionConverter::default().try_convert(&expr, &test_schema)?
+    );
+    assert!(converted.is_some());
+    // The whole expression is checked once, and every other node is converted once.
+    assert_eq!(converter.whole.load(AtomicOrdering::Relaxed), 1);
+    assert_eq!(converter.subexpressions.load(AtomicOrdering::Relaxed), 30);
     Ok(())
 }
 

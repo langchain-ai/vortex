@@ -16,6 +16,8 @@ mod scalars;
 pub(crate) mod schema;
 pub(crate) mod stats;
 
+pub use exprs::ConversionScope;
+pub use exprs::ConvertedExpression;
 pub use exprs::DefaultExpressionConverter;
 pub use exprs::ExpressionConverter;
 pub use exprs::ProcessedProjection;
