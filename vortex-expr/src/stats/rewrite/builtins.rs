@@ -520,7 +520,10 @@ impl StatsRewriteRule for ListContainsAllNonNanStatsRewrite {
 /// Lists with more elements falsify `needle IN list` with the bounds of the list rather than
 /// with a test per element, which keeps the pruning expression, and its evaluation per zone,
 /// small for the large lists of dynamic join filters.
-const MAX_LIST_ELEMENT_FALSIFICATIONS: usize = 16;
+///
+/// Bounds cannot prune zones that fall between the elements, such as the zones between
+/// clustered, time-ordered UUIDs, so lists of up to 64 elements are still tested per element.
+const MAX_LIST_ELEMENT_FALSIFICATIONS: usize = 64;
 
 /// The smallest and largest non-null elements, or `None` when there are none or two elements
 /// are unordered.
@@ -852,6 +855,7 @@ mod tests {
     use vortex_array::expr::BoundExpression;
     use vortex_array::expr::Expression;
     use vortex_array::expr::and;
+    use vortex_array::expr::and_collect;
     use vortex_array::expr::between;
     use vortex_array::expr::cast;
     use vortex_array::expr::col;
@@ -1207,10 +1211,32 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_list_contains_falsifier_per_element_up_to_64_elements() -> VortexResult<()> {
+        let elements: Vec<i32> = (0..64).map(|value| value * 100).collect();
+        let list = Scalar::list(
+            Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable)),
+            elements.iter().map(|value| Scalar::from(*value)).collect(),
+            Nullability::NonNullable,
+        );
+        let expr = list_contains(lit(list), col("a"));
+
+        assert_rewrite_eq!(
+            falsify(&expr)?,
+            and_collect(elements.iter().map(|value| {
+                or(
+                    lt(stat(col("a"), Stat::Max), lit(*value)),
+                    gt(stat(col("a"), Stat::Min), lit(*value)),
+                )
+            }))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rewrites_large_list_contains_falsifier_to_bounds() -> VortexResult<()> {
         let list = Scalar::list(
             Arc::new(DType::Primitive(PType::I32, Nullability::Nullable)),
-            (0..20)
+            (0..65)
                 .rev()
                 .map(|value| Scalar::from(Some(value)))
                 .chain([Scalar::null(DType::Primitive(
@@ -1226,7 +1252,7 @@ mod tests {
             falsify(&expr)?,
             Some(or(
                 lt(stat(col("a"), Stat::Max), lit(Scalar::from(Some(0i32)))),
-                gt(stat(col("a"), Stat::Min), lit(Scalar::from(Some(19i32)))),
+                gt(stat(col("a"), Stat::Min), lit(Scalar::from(Some(64i32)))),
             ))
         );
         Ok(())

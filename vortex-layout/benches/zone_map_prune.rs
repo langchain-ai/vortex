@@ -34,11 +34,13 @@ use vortex_array::expr::Expression;
 use vortex_array::expr::eq;
 use vortex_array::expr::gt;
 use vortex_array::expr::is_not_null;
+use vortex_array::expr::list_contains;
 use vortex_array::expr::lit;
 use vortex_array::expr::or;
 use vortex_array::expr::root;
 use vortex_array::memory::MemorySession;
 use vortex_array::optimizer::kernels::KernelSession;
+use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_expr::stats::rewrite::BoundExpressionPruneExt;
@@ -331,6 +333,25 @@ fn or_chain(bencher: Bencher, num_zones: usize) {
         bencher,
         numeric_zone_map(i32_dtype(), num_zones),
         PREDICATE.clone(),
+    );
+}
+
+fn list_contains_predicate(len: i32) -> BoundExpression {
+    let list = Scalar::list(
+        Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable)),
+        (0..len).map(|i| Scalar::from(i * 150)).collect(),
+        Nullability::NonNullable,
+    );
+    falsify(list_contains(lit(list), root()), &i32_dtype())
+}
+
+/// `IN` lists at the largest size falsified per element, and just past it.
+#[divan::bench(args = ZONE_COUNTS, consts = [16, 17, 64])]
+fn list_contains_n<const N: i32>(bencher: Bencher, num_zones: usize) {
+    run(
+        bencher,
+        numeric_zone_map(i32_dtype(), num_zones),
+        list_contains_predicate(N),
     );
 }
 
