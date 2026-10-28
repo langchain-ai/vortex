@@ -41,6 +41,8 @@ use vortex_array::scalar_fn::fns::is_not_null::IsNotNull;
 use vortex_array::scalar_fn::fns::is_null::IsNull;
 use vortex_array::scalar_fn::fns::like::Like;
 use vortex_array::scalar_fn::fns::list_contains::ListContains;
+use vortex_array::scalar_fn::fns::list_contains::PreparedSet;
+use vortex_array::scalar_fn::fns::list_contains::PreparedSetData;
 use vortex_array::scalar_fn::fns::literal::Literal;
 use vortex_array::scalar_fn::fns::operators::CompareOperator;
 use vortex_array::scalar_fn::fns::operators::Operator;
@@ -549,12 +551,12 @@ fn list_contains_falsify<P: NonNanProof>(
     let list = expr.child(0);
     let needle = expr.child(1);
 
-    let Some(list_scalar) = literal_stat(list, Stat::Min) else {
-        return Ok(None);
-    };
-    let elements = list_scalar
+    // Optimizing the expression turns a literal list into a prepared set, which keeps the list.
+    let list_scalar = list
         .as_opt::<Literal>()
-        .and_then(|literal| literal.as_list_opt())
+        .or_else(|| list.as_opt::<PreparedSet>().map(PreparedSetData::list));
+    let elements = list_scalar
+        .and_then(|list| list.as_list_opt())
         .and_then(|list| list.elements());
     let Some(elements) = elements else {
         return Ok(None);
@@ -883,6 +885,7 @@ mod tests {
     use vortex_array::scalar_fn::fns::between::StrictComparison;
     use vortex_array::scalar_fn::fns::binary::Binary;
     use vortex_array::scalar_fn::fns::dynamic::DynamicComparison;
+    use vortex_array::scalar_fn::fns::list_contains::PreparedSet;
     use vortex_array::scalar_fn::fns::operators::CompareOperator;
     use vortex_array::scalar_fn::internal::row_count::RowCount;
     use vortex_error::VortexResult;
@@ -1229,6 +1232,23 @@ mod tests {
                 )
             }))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn falsifies_list_contains_with_a_prepared_set() -> VortexResult<()> {
+        let list = Scalar::list(
+            Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable)),
+            vec![1.into(), 2.into(), 3.into()],
+            Nullability::NonNullable,
+        );
+        let bound = list_contains(lit(list), col("a")).bind(&test_scope())?;
+        let prepared = bound.optimize()?;
+        assert!(prepared.child(0).is::<PreparedSet>());
+
+        let falsified = prepared.falsify(&SESSION)?;
+        assert!(falsified.is_some());
+        assert_eq!(falsified, bound.falsify(&SESSION)?);
         Ok(())
     }
 
