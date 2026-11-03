@@ -115,7 +115,8 @@ impl FileOpener for VortexOpener {
         // retains the table and partition-field metadata declared by the plan.
         let output_schema = Arc::new(
             self.projection
-                .project_schema(self.table_schema.table_schema())?,
+                .project_schema(self.table_schema.table_schema())
+                .map_err(|e| exec_datafusion_err!("Failed to derive Vortex output schema: {e}"))?,
         );
         let session = self.session.clone();
         let metrics_registry = Arc::clone(&self.metrics_registry);
@@ -302,11 +303,14 @@ impl FileOpener for VortexOpener {
 
             // This is the expected arrow types of the actual columns in the file, which might have different types
             // from the unified logical schema or miss
-            let this_file_schema = Arc::new(calculate_physical_schema(
-                layout_reader.dtype(),
-                &unified_file_schema,
-                &session.arrow(),
-            )?);
+            let this_file_schema = Arc::new(
+                calculate_physical_schema(
+                    layout_reader.dtype(),
+                    &unified_file_schema,
+                    &session.arrow(),
+                )
+                .map_err(|e| exec_datafusion_err!("Failed to derive Vortex file schema: {e}"))?,
+            );
 
             let expr_adapter = expr_adapter_factory.create(
                 Arc::clone(&unified_file_schema),
@@ -324,18 +328,21 @@ impl FileOpener for VortexOpener {
                     simplifier.simplify(expr_adapter.rewrite(filter)?)
                 })
                 .transpose()?;
-            let projection =
-                projection.try_map_exprs(|p| simplifier.simplify(expr_adapter.rewrite(p)?))?;
+            let projection = projection
+                .try_map_exprs(|p| simplifier.simplify(expr_adapter.rewrite(p)?))
+                .map_err(|e| exec_datafusion_err!("Failed to adapt Vortex projection: {e}"))?;
 
             let ProcessedProjection {
                 scan_projection,
                 leftover_projection,
             } = if projection_pushdown {
-                expr_convertor.split_projection(
-                    projection.clone(),
-                    &this_file_schema,
-                    output_schema.as_ref(),
-                )?
+                expr_convertor
+                    .split_projection(
+                        projection.clone(),
+                        &this_file_schema,
+                        output_schema.as_ref(),
+                    )
+                    .map_err(|e| exec_datafusion_err!("Failed to split Vortex projection: {e}"))?
             } else {
                 // When projection pushdown is disabled, read only the required columns
                 // and apply the full projection after the scan.
@@ -365,11 +372,17 @@ impl FileOpener for VortexOpener {
                 Schema::new_with_metadata(fields, this_file_schema.metadata().clone())
             };
             let stream_schema =
-                calculate_physical_schema(&scan_dtype, &scan_reference_schema, &session.arrow())?;
+                calculate_physical_schema(&scan_dtype, &scan_reference_schema, &session.arrow())
+                    .map_err(|e| {
+                        exec_datafusion_err!("Failed to derive Vortex scan schema: {e}")
+                    })?;
 
             let leftover_projection = leftover_projection
-                .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
-            let projector = leftover_projection.make_projector(&stream_schema)?;
+                .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))
+                .map_err(|e| exec_datafusion_err!("Failed to reassign Vortex projection: {e}"))?;
+            let projector = leftover_projection
+                .make_projector(&stream_schema)
+                .map_err(|e| exec_datafusion_err!("Failed to build Vortex projector: {e}"))?;
 
             let mut scan_builder = ScanBuilder::new(session.clone(), Arc::clone(&layout_reader));
 
