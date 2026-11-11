@@ -26,12 +26,15 @@
 
 mod array;
 mod arrow;
+mod chunked;
 mod compute;
 #[cfg(test)]
 mod json_to_variant_tests;
 mod kernel;
 mod operations;
 mod validity;
+#[cfg(test)]
+mod variant_layout_tests;
 mod vtable;
 
 use std::sync::Arc;

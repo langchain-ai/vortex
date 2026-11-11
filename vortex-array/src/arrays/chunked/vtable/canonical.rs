@@ -31,6 +31,7 @@ use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::memory::HostAllocatorExt;
+use crate::optimizer::ArrayOptimizer;
 use crate::validity::Validity;
 
 pub(super) fn _canonicalize(
@@ -102,13 +103,16 @@ fn pack_variant_chunks(
         .try_collect()?;
 
     let outer_dtype = variant_chunks[0].dtype().clone();
+    // Variant has no builder to concatenate core storage with. Session rules registered by the
+    // core storage encoding may still merge the chunks into a single array.
     let core_storage = ChunkedArray::try_new(
         variant_chunks
             .iter()
             .map(|chunk| chunk.core_storage().clone()),
         outer_dtype,
     )?
-    .into_array();
+    .into_array()
+    .optimize_ctx(ctx.session())?;
 
     let shredded = match variant_chunks[0].shredded() {
         None => {

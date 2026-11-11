@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow_array::Array as ArrowArray;
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_schema::Field;
+use parquet_variant::EMPTY_VARIANT_METADATA_BYTES;
 use parquet_variant_compute::VariantArray as ArrowVariantArray;
 use vortex_array::Array;
 use vortex_array::ArrayParts;
@@ -43,6 +44,7 @@ use vortex_arrow::ArrowArrayExecutor;
 use vortex_arrow::ArrowSession;
 use vortex_arrow::to_arrow_null_buffer;
 use vortex_buffer::BitBuffer;
+use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
@@ -279,8 +281,22 @@ fn logical_shredded_from_parquet_field(
         // Partially shredded terminal object: keep raw `value` available as the nested
         // Variant core storage while exposing any typed children as nested `shredded`.
         let validity = inferred_shredded_field_validity(Some(&value), Some(&typed_value), ctx)?;
+        // A core storage without any raw value never reads its metadata, so it need not carry a
+        // copy of the column's metadata. The typed subtree below still decodes with `metadata`.
+        let core_metadata = if value.all_invalid(ctx)? {
+            ConstantArray::new(
+                Scalar::binary(
+                    ByteBuffer::copy_from(EMPTY_VARIANT_METADATA_BYTES),
+                    Nullability::NonNullable,
+                ),
+                value.len(),
+            )
+            .into_array()
+        } else {
+            metadata.clone()
+        };
         let parquet_field =
-            ParquetVariant::try_new(validity, metadata.clone(), Some(value), Some(typed_value))?;
+            ParquetVariant::try_new(validity, core_metadata, Some(value), Some(typed_value))?;
         let shredded = parquet_field
             .typed_value()
             .cloned()
@@ -369,6 +385,26 @@ pub(crate) fn parquet_typed_value_from_logical_shredded(
     .into_array())
 }
 
+/// Resolves Variant core storage to its Parquet Variant encoding.
+///
+/// Compression rebuilds core storage as an unshredded canonical Variant over the compressed
+/// Parquet Variant, so unwrap any such layers.
+pub(crate) fn parquet_core_storage(
+    core_storage: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let mut core = core_storage.clone().execute_until::<ParquetVariant>(ctx)?;
+    while !core.is::<ParquetVariant>() {
+        let unshredded_core = core
+            .as_opt::<Variant>()
+            .filter(|variant| variant.shredded().is_none())
+            .map(|variant| variant.core_storage().clone())
+            .ok_or_else(|| vortex_err!("Variant core storage is not Parquet Variant storage"))?;
+        core = unshredded_core.execute_until::<ParquetVariant>(ctx)?;
+    }
+    Ok(core)
+}
+
 /// Reconstructs one Parquet shredded field shell (`{value?, typed_value}`) from its canonical
 /// representation, the inverse of [`logical_shredded_from_parquet_field`].
 fn parquet_shredded_field_from_logical(
@@ -379,15 +415,14 @@ fn parquet_shredded_field_from_logical(
 
     // Partially shredded fields canonicalize to a nested Variant whose core storage holds the
     // residual `value` and whose own shredded tree holds the typed children.
-    if let Some(variant) = logical_field.as_opt::<Variant>() {
-        let core = variant
-            .core_storage()
-            .as_opt::<ParquetVariant>()
-            .ok_or_else(|| {
-                vortex_err!(
-                    "cannot rebuild Parquet shredded field: nested Variant lacks Parquet Variant core storage"
-                )
-            })?;
+    if logical_field.dtype().is_variant() {
+        let variant = logical_field.execute::<VariantArray>(ctx)?;
+        let core = parquet_core_storage(variant.core_storage(), ctx)?;
+        let core = core.as_opt::<ParquetVariant>().ok_or_else(|| {
+            vortex_err!(
+                "cannot rebuild Parquet shredded field: nested Variant lacks Parquet Variant core storage"
+            )
+        })?;
         let value = core.value().cloned().ok_or_else(|| {
             vortex_err!("cannot rebuild Parquet shredded field: partially shredded Variant has no residual value")
         })?;
