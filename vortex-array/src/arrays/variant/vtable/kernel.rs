@@ -87,6 +87,7 @@ impl ExecuteParentKernel<Variant> for VariantGetKernel {
             .options
             .dtype()
             .is_some_and(|dtype| !dtype.is_variant());
+        let fully_shredded = rest.is_empty() && !node.dtype().is_variant();
         let typed = if !rest.is_empty() {
             // The walk stopped at a partially shredded (nested Variant) field. That field carries
             // its own core storage and shredded tree, so it resolves the rest of the path itself.
@@ -146,6 +147,13 @@ impl ExecuteParentKernel<Variant> for VariantGetKernel {
         let typed = typed.cast(parent.dtype().clone())?;
         let typed_mask = typed.validity()?.execute_mask(typed.len(), ctx)?;
         if typed_mask.all_true() {
+            return Ok(Some(typed));
+        }
+
+        // EXPERIMENT: with VORTEX_VARIANT_TRUST_TYPED_NULLS set, follow Parquet's shredding
+        // semantics: a fully shredded field (no `value` column) never has its path in core
+        // storage, so its null typed rows are missing values rather than deferred to core storage.
+        if fully_shredded && trust_typed_nulls() {
             return Ok(Some(typed));
         }
 
@@ -277,4 +285,10 @@ fn execute_fallback_variant_get(
     VariantGet::try_new(core_storage, options)?
         .into_array()
         .execute::<ArrayRef>(ctx)
+}
+
+/// Whether the `VORTEX_VARIANT_TRUST_TYPED_NULLS` experiment switch is set.
+fn trust_typed_nulls() -> bool {
+    static TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRUST.get_or_init(|| std::env::var_os("VORTEX_VARIANT_TRUST_TYPED_NULLS").is_some())
 }
